@@ -1,5 +1,6 @@
 import os
 import torch
+import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss, ssim,  align_loss
 from gaussian_renderer import render, network_gui
@@ -9,6 +10,7 @@ from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr, save_tensor_as_image
+from utils.gs_utils import save_mst_ply
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from pytorch3d.loss import chamfer_distance
@@ -50,6 +52,89 @@ def render_alpha_approx(viewpoint_cam, gaussians, pipe, device):
         separate_sh=False,
     )
     return alpha_pkg["render"].mean(dim=0, keepdim=True).clamp(0.0, 1.0)
+
+def log_pipeline_stats(tag, gaussians, scene_extent=None):
+    n = gaussians.get_xyz.shape[0]
+    if n == 0:
+        print(f"[DEBUG][{tag}] num gaussians=0")
+        return
+    scales = gaussians.get_scaling.detach()
+    max_scale = scales.max(dim=1).values
+    msg = (
+        f"[DEBUG][{tag}] num gaussians={n} "
+        f"mean_scale={scales.mean().item():.6g} "
+        f"max_scale={max_scale.max().item():.6g}"
+    )
+    if scene_extent is not None:
+        msg += f" scene_extent={scene_extent:.6g}"
+    print(msg)
+
+def project_gaussians_to_camera(xyz, camera):
+    ones = torch.ones((xyz.shape[0], 1), dtype=xyz.dtype, device=xyz.device)
+    xyz_h = torch.cat([xyz, ones], dim=1)
+    clip = xyz_h @ camera.full_proj_transform.to(xyz.device)
+    raw_w = clip[:, 3]
+    w = raw_w.clamp(min=1e-8)
+    ndc = clip[:, :3] / w[:, None]
+    x = (ndc[:, 0] * 0.5 + 0.5) * (camera.image_width - 1)
+    y = (ndc[:, 1] * 0.5 + 0.5) * (camera.image_height - 1)
+    in_bounds = (raw_w > 0) & (x >= 0) & (x <= camera.image_width - 1) & (y >= 0) & (y <= camera.image_height - 1)
+    return x, y, in_bounds
+
+def gaussian_mask_visibility_scores(gaussians, cameras, device, max_cameras=64):
+    xyz = gaussians.get_xyz.detach()
+    score_sum = torch.zeros((xyz.shape[0],), dtype=torch.float32, device=device)
+    visible_count = torch.zeros_like(score_sum)
+    used = 0
+    for camera in cameras[:max_cameras]:
+        if not getattr(camera, "has_alpha_mask", False):
+            continue
+        mask = camera.alpha_mask.to(device).unsqueeze(0)
+        x, y, in_bounds = project_gaussians_to_camera(xyz, camera)
+        if not in_bounds.any():
+            continue
+        grid_x = (x[in_bounds] / max(camera.image_width - 1, 1)) * 2.0 - 1.0
+        grid_y = (y[in_bounds] / max(camera.image_height - 1, 1)) * 2.0 - 1.0
+        grid = torch.stack([grid_x, grid_y], dim=-1).view(1, -1, 1, 2)
+        sampled = F.grid_sample(mask, grid, align_corners=True).view(-1)
+        score_sum[in_bounds] += sampled
+        visible_count[in_bounds] += 1.0
+        used += 1
+    scores = score_sum / visible_count.clamp(min=1.0)
+    return scores, visible_count, used
+
+def filter_gaussians_by_masks(gaussians, cameras, threshold, min_views, device):
+    scores, visible_count, used_cameras = gaussian_mask_visibility_scores(gaussians, cameras, device)
+    if used_cameras == 0:
+        print("[DEBUG][object-filter] no object masks found; using all gaussians for StPr initialization.")
+        return gaussians, torch.ones((gaussians.get_xyz.shape[0],), dtype=torch.bool, device=device)
+    keep = (scores >= threshold) & (visible_count >= min_views)
+    if not keep.any():
+        best_idx = torch.argmax(scores)
+        keep[best_idx] = True
+        print("[DEBUG][object-filter] mask filter would remove all gaussians; keeping best-scoring gaussian.")
+    filtered = gaussians.clone_subset(keep)
+    print(
+        f"[DEBUG][object-filter] num input gaussians={gaussians.get_xyz.shape[0]} "
+        f"num object-visible gaussians={filtered.get_xyz.shape[0]} "
+        f"threshold={threshold} min_views={min_views} cameras={used_cameras}"
+    )
+    return filtered, keep
+
+def gaussian_projects_inside_mask(gaussians, camera, device, threshold=0.5):
+    if not getattr(camera, "has_alpha_mask", False):
+        return torch.ones((gaussians.get_xyz.shape[0],), dtype=torch.bool, device=device)
+    x, y, in_bounds = project_gaussians_to_camera(gaussians.get_xyz.detach(), camera)
+    result = torch.zeros((gaussians.get_xyz.shape[0],), dtype=torch.bool, device=device)
+    if not in_bounds.any():
+        return result
+    mask = camera.alpha_mask.to(device).unsqueeze(0)
+    grid_x = (x[in_bounds] / max(camera.image_width - 1, 1)) * 2.0 - 1.0
+    grid_y = (y[in_bounds] / max(camera.image_height - 1, 1)) * 2.0 - 1.0
+    grid = torch.stack([grid_x, grid_y], dim=-1).view(1, -1, 1, 2)
+    sampled = F.grid_sample(mask, grid, align_corners=True).view(-1)
+    result[in_bounds] = sampled >= threshold
+    return result
 
 def find_checkpoint_pair(checkpoint):
     root, ext = os.path.splitext(checkpoint)
@@ -167,11 +252,56 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 points_3dgs_path = os.path.join(args.source_path, "points_3dgs.ply")
                 if os.path.exists(points_3dgs_path):
                     gaussians_init.load_ply(points_3dgs_path)
-                stprs,appgs = gaussians_init.build_stprs_from_gs(num_clusters=100, method='3dgs', min_cluster_points=args.min_cluster_points)
+                log_pipeline_stats("canonical 3DGS", gaussians_init, scene.cameras_extent)
+                gaussians_init.save_ply(os.path.join(scene.model_path, "canonical_3dgs.ply"))
+                gaussians_for_stpr, object_keep = filter_gaussians_by_masks(
+                    gaussians_init,
+                    scene.getTrainCameras(),
+                    args.object_mask_threshold,
+                    args.object_mask_min_views,
+                    args.device,
+                )
+                gaussians_for_stpr.save_ply(os.path.join(scene.model_path, "object_filtered_3dgs.ply"))
+                log_pipeline_stats("object-filtered 3DGS", gaussians_for_stpr, scene.cameras_extent)
+                n_points_for_stpr = gaussians_for_stpr.get_xyz.shape[0]
+                num_clusters = max(args.stpr_min_clusters, min(args.stpr_max_clusters, max(1, n_points_for_stpr // 100)))
+                stprs,appgs = gaussians_for_stpr.build_stprs_from_gs(
+                    num_clusters=num_clusters,
+                    method='3dgs',
+                    min_cluster_points=args.min_cluster_points,
+                    scene_extent=scene.cameras_extent,
+                    stpr_min_scale_ratio=args.stpr_min_scale_ratio,
+                    stpr_max_scale_ratio=args.stpr_max_scale_ratio,
+                    debug_dir=scene.model_path,
+                    plant_prior=args.plant_prior,
+                )
+                gaussians_init.structure_gs = stprs
+                gaussians_init.appgs = appgs
+                gaussians_init.nn_stpr_appgs = gaussians_for_stpr.nn_stpr_appgs
                 stprs.training_setup(opt)
                 appgs.training_setup(opt)
-                stprs.save_ply(os.path.join(scene.model_path, "stprs_init.ply"))
+                stprs.save_ply(os.path.join(scene.model_path, "stprs_init_all.ply"))
+                stprs.save_ply(os.path.join(scene.model_path, "stprs_after_prune.ply"))
+                stprs.save_label_ply(os.path.join(scene.model_path, "stprs_init_branch.ply"), keep_labels={"branch"})
+                stprs.save_label_ply(os.path.join(scene.model_path, "stprs_init_leaf.ply"), keep_labels={"leaf"})
                 appgs.save_ply(os.path.join(scene.model_path, "appgs_init.ply"))
+                log_pipeline_stats("stprs_init_all", stprs, scene.cameras_extent)
+                log_pipeline_stats("appgs_init", appgs, scene.cameras_extent)
+                if stprs.stpr_label is not None:
+                    if stprs._pst_logit is not None:
+                        branch_mask = torch.sigmoid(stprs._pst_logit).view(-1) > 0.5
+                    else:
+                        branch_mask = torch.tensor([lbl == "branch" for lbl in stprs.stpr_label], dtype=torch.bool, device=args.device)
+                    print(f"[DEBUG][stpr] num branch labels={int(branch_mask.sum().item())} num leaf labels={int((~branch_mask).sum().item())}")
+                    if branch_mask.any():
+                        stprs.clone_subset(branch_mask, copy_structure_metadata=True).gs_to_graph(
+                            filename=os.path.join(scene.model_path, "branch_graph_before_mst_filter.ply")
+                        )
+                if appgs.app_label is not None:
+                    num_branch_appgs = sum(lbl == "branch" for lbl in appgs.app_label)
+                    print(f"[DEBUG][appgs] num branch AppGS={num_branch_appgs}")
+                mst_edges, mst_points, _ = gaussians_init.stpr_to_graph()
+                save_mst_ply(mst_points, mst_edges, os.path.join(scene.model_path, "branch_graph_final.ply"))
                 process_state = "appgs"
             # gaussians_init.update_nn_between_appgs_and_stprs()
  
@@ -238,14 +368,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ssim_value = ssim(masked_image, masked_gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-            if mask is not None and opt.lambda_mask > 0:
+            if mask is not None and (opt.lambda_bg_alpha > 0 or opt.lambda_bg_rgb > 0):
                 outside_mask = (1.0 - mask).clamp(0.0, 1.0)
                 outside_sum = outside_mask.sum().clamp(min=1.0)
                 rendered_alpha = render_alpha_approx(viewpoint_cam, gaussians_init, pipe, args.device)
                 bg_target = bg.view(-1, 1, 1) if bg.ndim == 1 else bg
                 outside_alpha_loss = (rendered_alpha * outside_mask).sum() / outside_sum
                 outside_rgb_loss = (torch.abs(image - bg_target) * outside_mask).sum() / (outside_sum * image.shape[0])
-                loss += opt.lambda_mask * (outside_alpha_loss + outside_rgb_loss)
+                loss += opt.lambda_bg_alpha * outside_alpha_loss + opt.lambda_bg_rgb * outside_rgb_loss
             
             # Depth regularization
             Ll1depth_pure = 0.0
@@ -366,6 +496,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ssim_value = ssim(masked_image, masked_gt_image)
             Ll1_stpr = masked_l1_loss(image_stprs, gt_image, mask) if mask is not None else l1_loss(image_stprs, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + 0.1 * Ll1_stpr
+            if mask is not None and (opt.lambda_bg_alpha > 0 or opt.lambda_bg_rgb > 0):
+                outside_mask = (1.0 - mask).clamp(0.0, 1.0)
+                outside_sum = outside_mask.sum().clamp(min=1.0)
+                rendered_alpha = render_alpha_approx(viewpoint_cam, appgs, pipe, args.device)
+                bg_target = bg.view(-1, 1, 1) if bg.ndim == 1 else bg
+                outside_alpha_loss = (rendered_alpha * outside_mask).sum() / outside_sum
+                outside_rgb_loss = (torch.abs(image - bg_target) * outside_mask).sum() / (outside_sum * image.shape[0])
+                loss += opt.lambda_bg_alpha * outside_alpha_loss + opt.lambda_bg_rgb * outside_rgb_loss
             # Depth regularization for stpr and appgs
             Ll1depth_pure = 0.0
             invDepth_appgs = None
@@ -409,7 +547,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     _,_,loss_mst = gaussians_init.stpr_to_graph()
                     loss += loss_mst * opt.lambda_mst
                 
-            loss_bind = gaussians_init.compute_gaussian_binding_loss(method='surface')
+            loss_bind = gaussians_init.compute_gaussian_binding_loss(method='surface', plant_prior=args.plant_prior)
             loss += loss_bind * opt.lambda_bind
             loss.backward()
 
@@ -445,8 +583,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.densify_until_iter:
                 if process_state == "init":
                 # Keep track of max radii in image-space for pruning
-                    gaussians_init.max_radii2D[visibility_filter] = torch.max(gaussians_init.max_radii2D[visibility_filter], radii[visibility_filter])
-                    gaussians_init.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                    object_visible_filter = visibility_filter & gaussian_projects_inside_mask(gaussians_init, viewpoint_cam, args.device, args.object_mask_threshold)
+                    gaussians_init.max_radii2D[object_visible_filter] = torch.max(gaussians_init.max_radii2D[object_visible_filter], radii[object_visible_filter])
+                    gaussians_init.add_densification_stats(viewspace_point_tensor, object_visible_filter)
                 
                     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -615,6 +754,13 @@ if __name__ == "__main__":
     parser.add_argument("--tb_image_interval", type=int, default=1000)
     parser.add_argument("--neighbor_update_interval", type=int, default=50)
     parser.add_argument("--min_cluster_points", type=int, default=100)
+    parser.add_argument("--object_mask_threshold", type=float, default=0.5)
+    parser.add_argument("--object_mask_min_views", type=int, default=1)
+    parser.add_argument("--stpr_min_clusters", type=int, default=10)
+    parser.add_argument("--stpr_max_clusters", type=int, default=1000)
+    parser.add_argument("--stpr_min_scale_ratio", type=float, default=1e-5)
+    parser.add_argument("--stpr_max_scale_ratio", type=float, default=0.5)
+    parser.add_argument("--plant_prior", choices=["mixed", "branch_only"], default="mixed")
     parser.add_argument('--gpu', type=int, default=0, help='Index of GPU device to use.')
     parser.add_argument("--reg_mask", action="store_true", default=False)
     parser.add_argument("--reg_align", action="store_true", default=False)

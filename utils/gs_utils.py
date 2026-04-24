@@ -132,7 +132,7 @@ def don_func(gaussian,radius1, radius2,threshold, knn1,knn2,method='radius',vis_
         o3d.io.write_point_cloud("output/ficus/max_5000/point_cloud/iteration_7000/branch.ply", pcd_branch)
         o3d.io.write_point_cloud("output/ficus/max_5000/point_cloud/iteration_7000/leaf.ply", pcd_leaf)
 
-def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_cluster_points=100): 
+def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_cluster_points=100, save_prefix=None): 
     from sklearn.cluster import DBSCAN
 
     # Dummy logic: let's just run DBSCAN to group roughly linear segments (can be seen as 'branches')
@@ -150,8 +150,9 @@ def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_clu
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
         pcd.colors = o3d.utility.Vector3dVector(point_colors)
-        o3d.io.write_point_cloud("dbscan_segmentation_ficus.ply", pcd)
-        print("Saved: dbscan_segmentation.ply")
+        path = f"{save_prefix}_labels.ply" if save_prefix else "dbscan_segmentation_ficus.ply"
+        o3d.io.write_point_cloud(path, pcd)
+        print(f"Saved: {path}")
     
     # add leaf branch filter
     leaf_color = [0.0, 1.0, 0.0]     # green
@@ -180,7 +181,8 @@ def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_clu
             label_branch.append(label)
     if save_ply:
         pcd.colors = o3d.utility.Vector3dVector(point_colors)
-        o3d.io.write_point_cloud("dbscan_segment_leaf_branch_ficus.ply", pcd)
+        path = f"{save_prefix}_leaf_branch.ply" if save_prefix else "dbscan_segment_leaf_branch_ficus.ply"
+        o3d.io.write_point_cloud(path, pcd)
     # return three labels
     return label_leaf, label_branch, labels
 
