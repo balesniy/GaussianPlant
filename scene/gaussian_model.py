@@ -713,9 +713,18 @@ class GaussianModel:
                     branch_index.append(index)
                     index += 1
                     # build cylinder gs
-            mesh_cylinder = branch_to_cylinder( branch_points=np.vstack(branch_points_all),branch_positions=branch_positions,
-                               branch_scales=branch_scales, branch_rotations=branch_rotations) # list of open3d mesh
-            leaf_disk = leaf_to_disk(leaf_positions=leaf_positions, leaf_scales=leaf_scales, leaf_rotations=leaf_rotations,save_flag=False) # list of open3d mesh
+            if branch_points_all:
+                mesh_cylinder = branch_to_cylinder(branch_points=np.vstack(branch_points_all), branch_positions=branch_positions,
+                                   branch_scales=branch_scales, branch_rotations=branch_rotations) # list of open3d mesh
+            else:
+                print("Warning: no branch primitives detected; continuing with leaf-only StPr initialization.")
+                mesh_cylinder = None
+
+            if leaf_positions:
+                leaf_disk = leaf_to_disk(leaf_positions=leaf_positions, leaf_scales=leaf_scales, leaf_rotations=leaf_rotations,save_flag=False) # list of open3d mesh
+            else:
+                print("Warning: no leaf primitives detected; continuing with branch-only StPr initialization.")
+                leaf_disk = None
             
             self.appgs = self.build_appgs_from_stprs(mesh_cylinder,branch_scales,branch_quat, branch_feature_dc,branch_feature_rest,
                                                      leaf_disk,leaf_scales, leaf_quat, leaf_feature_dc, leaf_feature_rest,
