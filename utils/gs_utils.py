@@ -584,6 +584,8 @@ def build_mst_from_endpoints(top, bottom, k:int=16):
     points[0::2] = top
     points[1::2] = bottom    
     M = points.shape[0]
+    if M == 0:
+        return np.empty((0, 2), dtype=np.int32), points
     row, col, data = [], [], []
 
     # (1)  zero‑weight internal edges
@@ -596,10 +598,16 @@ def build_mst_from_endpoints(top, bottom, k:int=16):
 
     # (2)  k‑NN edges  (Euclidean distance)
     tree = cKDTree(points)
-    dists, neigh = tree.query(points, k=k+1)     # first neighbour is itself
+    query_k = min(k + 1, M)
+    dists, neigh = tree.query(points, k=query_k)     # first neighbour is itself
+    if query_k == 1:
+        dists = dists[:, None]
+        neigh = neigh[:, None]
 
     for i in range(M):
         for j, d in zip(neigh[i, 1:], dists[i, 1:]):   # skip self
+            if j >= M or not np.isfinite(d):
+                continue
             row.append(i);  col.append(j);  data.append(d)
             # symmetric entry
             row.append(j);  col.append(i);  data.append(d)

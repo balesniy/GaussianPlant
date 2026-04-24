@@ -126,14 +126,20 @@ def mst_loss(top,bottom,stpr_roataions,mst_edges):
     loss_gap: penalize the gap between stprs
     """
     N = top.shape[0]
+    if N == 0:
+        return top.sum() * 0.0
     points = torch.zeros((2*N,3), device=top.device)
     points[0::2] = top
     points[1::2] = bottom    
     loss_mst = 0
     mst_edges = torch.tensor(mst_edges).to(top.device)
+    if mst_edges.numel() == 0:
+        return top.sum() * 0.0
     
     ext_mask   = (mst_edges//2)[:,0] != (mst_edges//2)[:,1]
     edge_idx   = mst_edges[ext_mask] 
+    if edge_idx.numel() == 0:
+        return top.sum() * 0.0
     gap = points[edge_idx[:,0]] - points[edge_idx[:,1]]
     # save paired points with the same color for test
     loss_gap = gap.mean()
