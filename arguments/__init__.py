@@ -100,6 +100,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_freq = 0.2
         self.lambda_opacity = 0.2
         self.lambda_mst = 0.2
+        self.lambda_bind = 1.0
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500

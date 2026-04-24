@@ -355,16 +355,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             render_pkg_appgs = render(viewpoint_cam, appgs, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
             image_stprs, depth_stprs, viewspace_point_tensor_stprs, visibility_filter_stprs, radii_stprs = render_pkg_stprs["render"], render_pkg_stprs["depth"], render_pkg_stprs["viewspace_points"], render_pkg_stprs["visibility_filter"], render_pkg_stprs["radii"]
             image, depth_appgs, viewspace_point_tensor, visibility_filter, radii = render_pkg_appgs["render"], render_pkg_appgs["depth"], render_pkg_appgs["viewspace_points"], render_pkg_appgs["visibility_filter"], render_pkg_appgs["radii"]
-            if viewpoint_cam.alpha_mask is not None:
-                alpha_mask = viewpoint_cam.alpha_mask.to(args.device)
-                image *= alpha_mask
+            mask = viewpoint_cam.alpha_mask.to(args.device) if getattr(viewpoint_cam, "has_alpha_mask", False) else None
             # Basic Loss
-            Ll1 = l1_loss(image, gt_image)
+            masked_image = image * mask if mask is not None else image
+            masked_gt_image = gt_image * mask if mask is not None else gt_image
+            Ll1 = masked_l1_loss(image, gt_image, mask) if mask is not None else l1_loss(image, gt_image)
             if FUSED_SSIM_AVAILABLE:
-                ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+                ssim_value = fused_ssim(masked_image.unsqueeze(0), masked_gt_image.unsqueeze(0))
             else:
-                ssim_value = ssim(image, gt_image)
-            Ll1_stpr = l1_loss(image_stprs, gt_image)
+                ssim_value = ssim(masked_image, masked_gt_image)
+            Ll1_stpr = masked_l1_loss(image_stprs, gt_image, mask) if mask is not None else l1_loss(image_stprs, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + 0.1 * Ll1_stpr
             # Depth regularization for stpr and appgs
             Ll1depth_pure = 0.0
@@ -410,8 +410,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss += loss_mst * opt.lambda_mst
                 
             loss_bind = gaussians_init.compute_gaussian_binding_loss(method='surface')
-            loss += loss_bind 
-            loss += loss
+            loss += loss_bind * opt.lambda_bind
             loss.backward()
 
         iter_end.record()
