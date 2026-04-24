@@ -34,6 +34,34 @@ def refresh_neighbors_if_needed(gaussians, iteration, interval):
     if gaussians.knn_idx is None or interval <= 1 or iteration % interval == 0:
         gaussians.reset_neighbors()
 
+def find_checkpoint_pair(checkpoint):
+    root, ext = os.path.splitext(checkpoint)
+    if ext != ".pth":
+        root = checkpoint
+
+    if root.endswith("_appgs"):
+        app_checkpoint = root + ".pth"
+        stpr_checkpoint = root[:-6] + "_stprs.pth"
+    elif root.endswith("_stprs"):
+        stpr_checkpoint = root + ".pth"
+        app_checkpoint = root[:-6] + "_appgs.pth"
+    else:
+        app_checkpoint = root + "_appgs.pth"
+        stpr_checkpoint = root + "_stprs.pth"
+
+    if os.path.exists(app_checkpoint) and os.path.exists(stpr_checkpoint):
+        return app_checkpoint, stpr_checkpoint
+    return None
+
+def restore_child_gaussians(checkpoint, dataset, opt, reference_gaussians):
+    model_params, iteration = torch.load(checkpoint)
+    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type, reference_gaussians.device)
+    gaussians.exposure_mapping = reference_gaussians.exposure_mapping
+    gaussians.pretrained_exposures = reference_gaussians.pretrained_exposures
+    gaussians._exposure = torch.nn.Parameter(reference_gaussians._exposure.detach().clone().requires_grad_(True))
+    gaussians.restore(model_params, opt)
+    return gaussians, iteration
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -49,11 +77,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians_init.training_setup(opt)
     gt_xyz = gaussians_init.get_xyz.detach()
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians_init.restore(model_params, opt)
-        appgs = gaussians_init.appgs
-        stprs = gaussians_init.stprs
-        process_state = 'appgs'
+        checkpoint_pair = find_checkpoint_pair(checkpoint)
+        if checkpoint_pair is not None:
+            app_checkpoint, stpr_checkpoint = checkpoint_pair
+            appgs, app_iter = restore_child_gaussians(app_checkpoint, dataset, opt, gaussians_init)
+            stprs, stpr_iter = restore_child_gaussians(stpr_checkpoint, dataset, opt, gaussians_init)
+            if app_iter != stpr_iter:
+                raise ValueError(f"Checkpoint iteration mismatch: {app_checkpoint} is {app_iter}, {stpr_checkpoint} is {stpr_iter}")
+            first_iter = app_iter
+            gaussians_init.appgs = appgs
+            gaussians_init.structure_gs = stprs
+            gaussians_init.update_nn_between_appgs_and_stprs()
+            process_state = 'appgs'
+        else:
+            (model_params, first_iter) = torch.load(checkpoint)
+            gaussians_init.restore(model_params, opt)
+            process_state = 'init'
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")

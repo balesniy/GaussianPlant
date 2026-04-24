@@ -106,29 +106,43 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
             self.n_points,
-            # self.appgs,
-            # self.structure_gs,
+            {
+                "app_label": self.app_label,
+                "stpr_label": self.stpr_label,
+                "exposure": self._exposure,
+                "exposure_optimizer": self.exposure_optimizer.state_dict() if hasattr(self, "exposure_optimizer") else None,
+            },
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
+        metadata = {}
+        if len(model_args) > 14:
+            metadata = model_args[14]
+            model_args = model_args[:14]
+        (self.active_sh_degree,
+        self._xyz,
+        self._features_dc,
         self._features_rest,
-        self._scaling, 
-        self._rotation, 
+        self._scaling,
+        self._rotation,
         self._opacity,
         self._mask,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
+        self.max_radii2D,
+        xyz_gradient_accum,
         denom,
-        opt_dict, 
+        opt_dict,
         self.spatial_lr_scale,
         self.n_points) = model_args
+        if metadata.get("exposure") is not None:
+            self._exposure = metadata["exposure"]
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        if metadata.get("exposure_optimizer") is not None:
+            self.exposure_optimizer.load_state_dict(metadata["exposure_optimizer"])
+        self.app_label = metadata.get("app_label")
+        self.stpr_label = metadata.get("stpr_label")
         
 
     @property
