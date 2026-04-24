@@ -34,6 +34,23 @@ def refresh_neighbors_if_needed(gaussians, iteration, interval):
     if gaussians.knn_idx is None or interval <= 1 or iteration % interval == 0:
         gaussians.reset_neighbors()
 
+def masked_l1_loss(network_output, gt, mask):
+    mask_sum = mask.sum().clamp(min=1.0)
+    return (torch.abs(network_output - gt) * mask).sum() / (mask_sum * network_output.shape[0])
+
+def render_alpha_approx(viewpoint_cam, gaussians, pipe, device):
+    alpha_bg = torch.zeros((3), dtype=torch.float32, device=device)
+    alpha_color = torch.ones((gaussians.get_xyz.shape[0], 3), dtype=torch.float32, device=device)
+    alpha_pkg = render(
+        viewpoint_cam,
+        gaussians,
+        pipe,
+        alpha_bg,
+        override_color=alpha_color,
+        separate_sh=False,
+    )
+    return alpha_pkg["render"].mean(dim=0, keepdim=True).clamp(0.0, 1.0)
+
 def find_checkpoint_pair(checkpoint):
     root, ext = os.path.splitext(checkpoint)
     if ext != ".pth":
@@ -209,17 +226,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             render_pkg = render(viewpoint_cam, gaussians_init, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
             image,  depth, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-            if viewpoint_cam.alpha_mask is not None:
-                        alpha_mask = viewpoint_cam.alpha_mask.to(args.device)
-                        image *= alpha_mask
+            mask = viewpoint_cam.alpha_mask.to(args.device) if getattr(viewpoint_cam, "has_alpha_mask", False) else None
             
             # Basic Loss
-            Ll1 = l1_loss(image, gt_image)
+            masked_image = image * mask if mask is not None else image
+            masked_gt_image = gt_image * mask if mask is not None else gt_image
+            Ll1 = masked_l1_loss(image, gt_image, mask) if mask is not None else l1_loss(image, gt_image)
             if FUSED_SSIM_AVAILABLE:
-                ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+                ssim_value = fused_ssim(masked_image.unsqueeze(0), masked_gt_image.unsqueeze(0))
             else:
-                ssim_value = ssim(image, gt_image)
+                ssim_value = ssim(masked_image, masked_gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+            if mask is not None and opt.lambda_mask > 0:
+                outside_mask = (1.0 - mask).clamp(0.0, 1.0)
+                outside_sum = outside_mask.sum().clamp(min=1.0)
+                rendered_alpha = render_alpha_approx(viewpoint_cam, gaussians_init, pipe, args.device)
+                bg_target = bg.view(-1, 1, 1) if bg.ndim == 1 else bg
+                outside_alpha_loss = (rendered_alpha * outside_mask).sum() / outside_sum
+                outside_rgb_loss = (torch.abs(image - bg_target) * outside_mask).sum() / (outside_sum * image.shape[0])
+                loss += opt.lambda_mask * (outside_alpha_loss + outside_rgb_loss)
             
             # Depth regularization
             Ll1depth_pure = 0.0

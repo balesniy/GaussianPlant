@@ -50,6 +50,10 @@ class ModelParams(ParamGroup):
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
+        self.masks = ""
+        self.soft_mask_inner_band = 6
+        self.soft_mask_outer_band = 2
+        self.soft_mask_edge_low = 0.35
         self._depths = ""
         self._resolution = -1
         self._white_background = False
@@ -61,6 +65,8 @@ class ModelParams(ParamGroup):
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        if hasattr(g, "masks") and g.masks:
+            g.masks = g.masks if os.path.isabs(g.masks) else os.path.abspath(os.path.join(g.source_path, g.masks))
         return g
 
 class PipelineParams(ParamGroup):
