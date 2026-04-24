@@ -430,6 +430,8 @@ class GaussianModel:
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
+        self.knn_dists = None
+        self.knn_idx = None
         if flag=='app':
             self.app_label = [lbl for lbl, m in zip(self.app_label, valid_points_mask) if m]
             assert len(self.app_label) == self.get_xyz.shape[0]
@@ -489,6 +491,8 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self.device)
+        self.knn_dists = None
+        self.knn_idx = None
         
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, flag=Literal['app','stpr'],N=2):
@@ -575,8 +579,6 @@ class GaussianModel:
         self.prune_points(prune_mask,flag=flag)
         print(f"Pruned {prune_low_opacity_count} points with low opacity, {prune_large_count} points with large screen size, {prune_small_count} points with small screen size.")
 
-
-        torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)

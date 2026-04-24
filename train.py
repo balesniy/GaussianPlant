@@ -30,6 +30,10 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+def refresh_neighbors_if_needed(gaussians, iteration, interval):
+    if gaussians.knn_idx is None or interval <= 1 or iteration % interval == 0:
+        gaussians.reset_neighbors()
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -156,7 +160,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # stage 1: init
         if process_state == "init":
             gaussians_init.update_learning_rate(iteration)
-            gaussians_init.reset_neighbors()
             # Every 1000 its we increase the levels of SH up to a maximum degree
             if iteration % 1000 == 0:
                 gaussians_init.oneupSHdegree()
@@ -198,7 +201,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_align = 0
             loss_overlap = 0
             if args.reg_align or args.reg_overlap:
-                gaussians_init.reset_neighbors()
+                refresh_neighbors_if_needed(gaussians_init, iteration, args.neighbor_update_interval)
                 neighbor_idx  = gaussians_init.get_neighbors_of_random_points(gaussians_init.get_xyz.shape[0] // 10)
             if args.reg_align:
                 # gaussian_align = gaussians_init.compute_gaussian_alignment_with_neighbors(neighbor_idx)
@@ -213,7 +216,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
         elif process_state == "stprs" :
             stprs.update_learning_rate(iteration)
-            stprs.reset_neighbors()
             # Every 1000 its we increase the levels of SH up to a maximum degree
             if iteration % 1000 == 0:
                 stprs.oneupSHdegree()
@@ -257,7 +259,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
             if args.reg_align or args.reg_overlap:
-                stprs.reset_neighbors()
+                refresh_neighbors_if_needed(stprs, iteration, args.neighbor_update_interval)
                 neighbor_idx  = stprs.get_neighbors_of_random_points(stprs.get_xyz.shape[0] )
             if args.reg_align:
                 # gaussian_align = stprs.compute_gaussian_alignment_with_neighbors(neighbor_idx)
@@ -320,9 +322,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if iteration >100:
                 # appgs.reset_neighbors()
-                stprs.reset_neighbors()
+                refresh_neighbors_if_needed(stprs, iteration, args.neighbor_update_interval)
                 neighbor_idx  = stprs.get_neighbors_of_random_points(-1)
-                appgs.reset_neighbors()
+                refresh_neighbors_if_needed(appgs, iteration, args.neighbor_update_interval)
                 neighbor_idx_app  = appgs.get_neighbors_of_random_points(-1)
                 # neighbor_idx_appg  = appgs.get_neighbors_of_random_points(stprs.get_xyz.shape[0]//10)
                 if args.reg_align:
@@ -368,7 +370,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 num_appgs = appgs.get_xyz.shape[0]
             if stprs is not None:
                 num_stprs = stprs.get_xyz.shape[0]
-            training_report(tb_writer, iteration, Ll1, loss, Ll1depth_pure,loss_align, loss_overlap,l1_loss, testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, image,  invDepth_appgs,invDepth_stprs,mono_invdepth, image_stprs,loss_freq, num_appgs, num_stprs, loss_opacity_app, loss_opacity_stprs, loss_bind,loss_mst)
+            training_report(tb_writer, iteration, Ll1, loss, Ll1depth_pure,loss_align, loss_overlap,l1_loss, testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, image,  invDepth_appgs,invDepth_stprs,mono_invdepth, image_stprs,loss_freq, num_appgs, num_stprs, loss_opacity_app, loss_opacity_stprs, loss_bind,loss_mst, args.tb_image_interval)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration,save_app=True,save_stpr=True,save_branch=True)
@@ -465,7 +467,7 @@ def prepare_output_and_logger(args):
 
 def training_report(tb_writer, iteration, Ll1, loss, loss_depth,loss_align,loss_overlap,l1_loss, testing_iterations, 
                     scene : Scene, renderFunc, renderArgs, train_test_exp, image, depth_appgs, depth_stprs
-,mono_invdepth,image_stprs,loss_freq, num_appgs, num_stprs, loss_opacity_appgs, loss_opacity_stprs, loss_bind,loss_mst):
+,mono_invdepth,image_stprs,loss_freq, num_appgs, num_stprs, loss_opacity_appgs, loss_opacity_stprs, loss_bind,loss_mst, tb_image_interval):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -480,16 +482,16 @@ def training_report(tb_writer, iteration, Ll1, loss, loss_depth,loss_align,loss_
         tb_writer.add_scalar('train_loss_patches/binding_loss', loss_bind, iteration)
         tb_writer.add_scalar('train_loss_patches/mst_loss', loss_mst, iteration)
         
-        # add image 
-        tb_writer.add_images('train_image_patches/render', image[None], global_step=iteration)
-        if depth_stprs is not None:
-            tb_writer.add_images('train_image_patches/depth_stprs', depth_stprs[None], global_step=iteration)
-        if depth_appgs is not None:
-            tb_writer.add_images('train_image_patches/depth_appgs', depth_appgs[None], global_step=iteration)
-        if mono_invdepth is not None:
-            tb_writer.add_images('train_image_patches/mono_invdepth', mono_invdepth[None], global_step=iteration)
-        if image_stprs is not None:
-            tb_writer.add_images('train_image_patches/stprs_render', image_stprs[None], global_step=iteration)
+        if tb_image_interval > 0 and iteration % tb_image_interval == 0:
+            tb_writer.add_images('train_image_patches/render', image[None], global_step=iteration)
+            if depth_stprs is not None:
+                tb_writer.add_images('train_image_patches/depth_stprs', depth_stprs[None], global_step=iteration)
+            if depth_appgs is not None:
+                tb_writer.add_images('train_image_patches/depth_appgs', depth_appgs[None], global_step=iteration)
+            if mono_invdepth is not None:
+                tb_writer.add_images('train_image_patches/mono_invdepth', mono_invdepth[None], global_step=iteration)
+            if image_stprs is not None:
+                tb_writer.add_images('train_image_patches/stprs_render', image_stprs[None], global_step=iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -541,6 +543,8 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[3000,7000,15000,30000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--tb_image_interval", type=int, default=1000)
+    parser.add_argument("--neighbor_update_interval", type=int, default=50)
     parser.add_argument('--gpu', type=int, default=0, help='Index of GPU device to use.')
     parser.add_argument("--reg_mask", action="store_true", default=False)
     parser.add_argument("--reg_align", action="store_true", default=False)
