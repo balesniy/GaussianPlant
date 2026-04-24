@@ -461,7 +461,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_label,flag):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_label=None, flag=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -478,12 +478,14 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
-        if flag=='app':
+        if flag == 'app':
             self.app_label.extend(new_label)
             assert len(self.app_label) == self.get_xyz.shape[0]
-        elif flag=='stpr':
+        elif flag == 'stpr':
             self.stpr_label.extend(new_label)
             assert len(self.stpr_label) == self.get_xyz.shape[0]
+        elif flag is not None:
+            raise ValueError(f"Unknown densification flag: {flag}")
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self.device)
@@ -509,12 +511,15 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+        new_label = None
         if flag == 'app':
             new_label = [lbl for lbl, m in zip(self.app_label, selected_pts_mask) if m]
             new_label = new_label * N
         elif flag == 'stpr':
             new_label = [lbl for lbl, m in zip(self.stpr_label, selected_pts_mask) if m]
             new_label = new_label * N
+        elif flag is not None:
+            raise ValueError(f"Unknown densification flag: {flag}")
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii,new_label,flag)
 
@@ -535,10 +540,13 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        new_label = None
         if flag == 'app':
             new_label = [lbl for lbl, m in zip(self.app_label, selected_pts_mask) if m]
         elif flag == 'stpr':
             new_label = [lbl for lbl, m in zip(self.stpr_label, selected_pts_mask) if m]
+        elif flag is not None:
+            raise ValueError(f"Unknown densification flag: {flag}")
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii,new_label,flag)
 
@@ -1548,4 +1556,3 @@ class GaussianModel:
         # graph loss 
         loss_graph = mst_loss(top,bottom,rot_matrix,mst_edges) 
         return mst_edges, points,loss_graph
-

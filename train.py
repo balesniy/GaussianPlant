@@ -382,7 +382,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 
                     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                        gaussians_init.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                        gaussians_init.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, flag=None)
                        
                     if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                         gaussians_init.reset_opacity()
@@ -393,10 +393,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if iteration > opt.densify_from_iter and iteration % opt.densification_interval:
                         if stprs._xyz.shape[0]<=args.max_stpr_num:
                             size_threshold = 30 if iteration > opt.opacity_reset_interval else None # size_threshold:20
-                            stprs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, size_threshold_small=None)
+                            stprs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, flag='stpr', size_threshold_small=None)
                         else:
                             size_threshold = 30 if iteration > opt.opacity_reset_interval else None
-                            stprs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent*10, size_threshold, radii, only_prune=True)
+                            stprs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent*10, size_threshold, radii, flag='stpr', only_prune=True)
                     if iteration % opt.opacity_reset_interval == 0:
                         stprs.reset_opacity_stpr()
 
