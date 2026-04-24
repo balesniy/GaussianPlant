@@ -113,18 +113,18 @@ class GaussianModel:
     def restore(self, model_args, training_args):
         (self.active_sh_degree, 
         self._xyz, 
-        self._mask,
         self._features_dc, 
         self._features_rest,
         self._scaling, 
         self._rotation, 
         self._opacity,
+        self._mask,
         self.max_radii2D, 
-        self.n_points,
         xyz_gradient_accum, 
         denom,
         opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale,
+        self.n_points) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom

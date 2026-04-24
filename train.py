@@ -108,7 +108,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 opt.iter_build_stprs = 7000
                 opt.iter_build_appgs = 7000
             if iteration == opt.iter_build_stprs:   # build stprs from inital gaussians
-                gaussians_init.load_ply(os.path.join(args.source_path, "points_3dgs.ply"))
+                points_3dgs_path = os.path.join(args.source_path, "points_3dgs.ply")
+                if os.path.exists(points_3dgs_path):
+                    gaussians_init.load_ply(points_3dgs_path)
                 stprs,appgs = gaussians_init.build_stprs_from_gs(num_clusters=100, method='3dgs')
                 stprs.training_setup(opt)
                 appgs.training_setup(opt)
@@ -439,9 +441,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((appgs.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + "_appgs.pth")
-                torch.save((stprs.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + "_stprs.pth")
-                # torch.save((gaussians_init.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                if appgs is not None:
+                    torch.save((appgs.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + "_appgs.pth")
+                if stprs is not None:
+                    torch.save((stprs.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + "_stprs.pth")
+                if appgs is None and stprs is None:
+                    torch.save((gaussians_init.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):   
     if not args.model_path:
