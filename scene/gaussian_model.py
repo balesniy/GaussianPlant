@@ -598,7 +598,7 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    def build_stprs_from_gs(self, num_clusters=100,method: Literal['kmeans', 'random', '3dgs'] = '3dgs'):
+    def build_stprs_from_gs(self, num_clusters=100,method: Literal['kmeans', 'random', '3dgs'] = '3dgs', min_cluster_points=100):
         """
         structural primitives (StPrs) from optimized Gaussians by clustering them.
         param num_clusters: Number of clusters for grouping Gaussians into structural primitives.
@@ -663,7 +663,7 @@ class GaussianModel:
             Build structural primitives (StPrs) from optimized Gaussians using 3D Gaussian clustering.
             Using segmented leaf&branch points information for initialize leaf stpr(disk) and branch stpr(cylinder).
             """
-            label_leaf, label_branch, labels = fit_cylinder_ransac(xyz, save_ply=False)
+            label_leaf, label_branch, labels = fit_cylinder_ransac(xyz, save_ply=False, min_cluster_points=min_cluster_points)
             index = 0
             for i,label in enumerate(np.unique(labels)):
                 if label in label_leaf:
@@ -713,6 +713,29 @@ class GaussianModel:
                     branch_index.append(index)
                     index += 1
                     # build cylinder gs
+
+            if not stpr_positions:
+                print("Warning: no DBSCAN leaf/branch clusters detected; falling back to one leaf-like primitive from all Gaussians.")
+                mean, stpr_rot, stpr_scale, rot_cylinder, rot_disk = estimate_gs_para_from_cluster(xyz, test_flag=False)
+                stpr_scale[2] = 1e-6
+                stpr_positions.append(mean)
+                stpr_scales.append(stpr_scale)
+                stpr_rotations.append(stpr_rot)
+                feature_dc_stpr = feature_dc.mean(axis=0)
+                feature_rest_stpr = feature_rest.mean(axis=0)
+                stpr_features_dc.append(feature_dc_stpr)
+                stpr_features_rest.append(feature_rest_stpr)
+                leaf_positions.append(mean)
+                leaf_scales.append(stpr_scale)
+                leaf_quat.append(stpr_rot)
+                leaf_rotations.append(rot_disk)
+                leaf_feature_dc.append(feature_dc_stpr)
+                leaf_feature_rest.append(feature_rest_stpr)
+                surf_rotations.append(rot_disk)
+                stpr_label.append('leaf')
+                leaf_index.append(index)
+                index += 1
+
             if branch_points_all:
                 mesh_cylinder = branch_to_cylinder(branch_points=np.vstack(branch_points_all), branch_positions=branch_positions,
                                    branch_scales=branch_scales, branch_rotations=branch_rotations) # list of open3d mesh
@@ -755,6 +778,9 @@ class GaussianModel:
         stpr_sur_rots = torch.tensor(np.array(surf_rotations), dtype=torch.float, device=self.device)
         # scale filter for the stpr to remove background large gs
         scale_filter = stpr_scales.max(dim=1).values< 1
+        if not scale_filter.any():
+            print("Warning: scale filter would remove all StPrs; keeping unfiltered primitives.")
+            scale_filter = torch.ones_like(scale_filter, dtype=torch.bool)
         stpr_positions = stpr_positions[scale_filter]
         stpr_scales = stpr_scales[scale_filter]
         stpr_scales = torch.log(stpr_scales)

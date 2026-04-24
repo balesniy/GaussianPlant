@@ -132,7 +132,7 @@ def don_func(gaussian,radius1, radius2,threshold, knn1,knn2,method='radius',vis_
         o3d.io.write_point_cloud("output/ficus/max_5000/point_cloud/iteration_7000/branch.ply", pcd_branch)
         o3d.io.write_point_cloud("output/ficus/max_5000/point_cloud/iteration_7000/leaf.ply", pcd_leaf)
 
-def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False): 
+def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_cluster_points=100): 
     from sklearn.cluster import DBSCAN
 
     # Dummy logic: let's just run DBSCAN to group roughly linear segments (can be seen as 'branches')
@@ -168,7 +168,7 @@ def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False):
 
         cluster_points = points[labels == label]
 
-        if len(cluster_points) < 100:
+        if len(cluster_points) < min_cluster_points:
             point_colors[labels == label] = noise_color
             continue
 

@@ -150,7 +150,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 points_3dgs_path = os.path.join(args.source_path, "points_3dgs.ply")
                 if os.path.exists(points_3dgs_path):
                     gaussians_init.load_ply(points_3dgs_path)
-                stprs,appgs = gaussians_init.build_stprs_from_gs(num_clusters=100, method='3dgs')
+                stprs,appgs = gaussians_init.build_stprs_from_gs(num_clusters=100, method='3dgs', min_cluster_points=args.min_cluster_points)
                 stprs.training_setup(opt)
                 appgs.training_setup(opt)
                 stprs.save_ply(os.path.join(scene.model_path, "stprs_init.ply"))
@@ -589,6 +589,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--tb_image_interval", type=int, default=1000)
     parser.add_argument("--neighbor_update_interval", type=int, default=50)
+    parser.add_argument("--min_cluster_points", type=int, default=100)
     parser.add_argument('--gpu', type=int, default=0, help='Index of GPU device to use.')
     parser.add_argument("--reg_mask", action="store_true", default=False)
     parser.add_argument("--reg_align", action="store_true", default=False)
