@@ -53,6 +53,25 @@ def render_alpha_approx(viewpoint_cam, gaussians, pipe, device):
     )
     return alpha_pkg["render"].mean(dim=0, keepdim=True).clamp(0.0, 1.0)
 
+def render_semantic_object(viewpoint_cam, gaussians, pipe, device):
+    semantic_color = gaussians.get_semantic.repeat(1, 3)
+    semantic_pkg = render(
+        viewpoint_cam,
+        gaussians,
+        pipe,
+        torch.zeros((3), dtype=torch.float32, device=device),
+        override_color=semantic_color,
+        separate_sh=False,
+    )
+    return semantic_pkg["render"].mean(dim=0, keepdim=True).clamp(1e-4, 1.0 - 1e-4)
+
+def object_semantic_loss(viewpoint_cam, gaussians, pipe, device):
+    if not getattr(viewpoint_cam, "has_alpha_mask", False):
+        return torch.tensor(0.0, device=device)
+    target = viewpoint_cam.alpha_mask.to(device).clamp(0.0, 1.0)
+    semantic_render = render_semantic_object(viewpoint_cam, gaussians, pipe, device)
+    return F.binary_cross_entropy(semantic_render, target)
+
 def log_pipeline_stats(tag, gaussians, scene_extent=None):
     n = gaussians.get_xyz.shape[0]
     if n == 0:
@@ -175,6 +194,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     appgs = None
     stprs = None
     process_state = "init"
+    stage_c_start_iter = None
+    stage_c_end_iter = None
     scene = Scene(dataset, gaussians_init)
     gaussians_init.training_setup(opt)
     gt_xyz = gaussians_init.get_xyz.detach()
@@ -246,9 +267,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 opt.iter_build_stprs= 1
                 opt.iter_build_appgs = 1
             else:
-                opt.iter_build_stprs = 7000
-                opt.iter_build_appgs = 7000
+                opt.iter_build_stprs = args.stage_a_iterations
+                opt.iter_build_appgs = args.stage_a_iterations
             if iteration == opt.iter_build_stprs:   # build stprs from inital gaussians
+                print(f"[STAGE B] Building StPr/AppGS from object-centric canonical 3DGS at iteration {iteration}.")
                 points_3dgs_path = os.path.join(args.source_path, "points_3dgs.ply")
                 if os.path.exists(points_3dgs_path):
                     gaussians_init.load_ply(points_3dgs_path)
@@ -273,7 +295,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     stpr_min_scale_ratio=args.stpr_min_scale_ratio,
                     stpr_max_scale_ratio=args.stpr_max_scale_ratio,
                     debug_dir=scene.model_path,
-                    plant_prior=args.plant_prior,
+                    plant_prior="branch_only" if args.no_leaf_mode else args.plant_prior,
+                    no_leaf_mode=args.no_leaf_mode,
                 )
                 gaussians_init.structure_gs = stprs
                 gaussians_init.appgs = appgs
@@ -302,8 +325,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     print(f"[DEBUG][appgs] num branch AppGS={num_branch_appgs}")
                 mst_edges, mst_points, _ = gaussians_init.stpr_to_graph()
                 save_mst_ply(mst_points, mst_edges, os.path.join(scene.model_path, "branch_graph_final.ply"))
-                process_state = "appgs"
+                gaussians_init.save_ply(os.path.join(args.source_path, "points_3dgs_object.ply"))
+                stage_c_start_iter = iteration
+                stage_c_end_iter = iteration + args.stage_c_iterations
+                process_state = "stprs" if args.stage_c_iterations > 0 else "appgs"
+                print(f"[STAGE C] StPr warm-up until iteration {stage_c_end_iter}; AppGS joint stage starts after that.")
             # gaussians_init.update_nn_between_appgs_and_stprs()
+        elif process_state == "stprs" and stage_c_end_iter is not None and iteration > stage_c_end_iter:
+            process_state = "appgs"
+            print(f"[STAGE D] Joint AppGS/StPr optimization starts at iteration {iteration}.")
  
          # Pick a random Camera
         if not viewpoint_stack:
@@ -376,6 +406,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 outside_alpha_loss = (rendered_alpha * outside_mask).sum() / outside_sum
                 outside_rgb_loss = (torch.abs(image - bg_target) * outside_mask).sum() / (outside_sum * image.shape[0])
                 loss += opt.lambda_bg_alpha * outside_alpha_loss + opt.lambda_bg_rgb * outside_rgb_loss
+            if opt.lambda_obj_sem > 0:
+                loss += opt.lambda_obj_sem * object_semantic_loss(viewpoint_cam, gaussians_init, pipe, args.device)
             
             # Depth regularization
             Ll1depth_pure = 0.0
@@ -427,13 +459,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 image_stprs *= alpha_mask
             
             # Basic Loss
-            # Ll1 = l1_loss(image_stprs, gt_image)
-            # if FUSED_SSIM_AVAILABLE:
-            #     ssim_value = fused_ssim(image_stprs.unsqueeze(0), gt_image.unsqueeze(0))
-            # else:
-            #     ssim_value = ssim(image_stprs, gt_image)
-            # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-            loss = 0
+            mask = viewpoint_cam.alpha_mask.to(args.device) if getattr(viewpoint_cam, "has_alpha_mask", False) else None
+            masked_image = image_stprs * mask if mask is not None else image_stprs
+            masked_gt_image = gt_image * mask if mask is not None else gt_image
+            Ll1 = masked_l1_loss(image_stprs, gt_image, mask) if mask is not None else l1_loss(image_stprs, gt_image)
+            if FUSED_SSIM_AVAILABLE:
+                ssim_value = fused_ssim(masked_image.unsqueeze(0), masked_gt_image.unsqueeze(0))
+            else:
+                ssim_value = ssim(masked_image, masked_gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+            if opt.lambda_obj_sem > 0:
+                loss += opt.lambda_obj_sem * object_semantic_loss(viewpoint_cam, stprs, pipe, args.device)
             # Depth regularization
             Ll1depth_pure = 0.0
             invDepth = None
@@ -471,6 +507,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 loss_freq = stprs.low_freq_loss()
                 loss += loss_freq * opt.lambda_freq
             # binding loss
+            if appgs is not None and opt.lambda_bind > 0:
+                loss_bind = gaussians_init.compute_gaussian_binding_loss(method='surface', plant_prior="branch_only" if args.no_leaf_mode else args.plant_prior)
+                loss += loss_bind * opt.lambda_bind
             
             loss.backward()
             
@@ -504,6 +543,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 outside_alpha_loss = (rendered_alpha * outside_mask).sum() / outside_sum
                 outside_rgb_loss = (torch.abs(image - bg_target) * outside_mask).sum() / (outside_sum * image.shape[0])
                 loss += opt.lambda_bg_alpha * outside_alpha_loss + opt.lambda_bg_rgb * outside_rgb_loss
+            if opt.lambda_obj_sem > 0:
+                loss += opt.lambda_obj_sem * object_semantic_loss(viewpoint_cam, appgs, pipe, args.device)
             # Depth regularization for stpr and appgs
             Ll1depth_pure = 0.0
             invDepth_appgs = None
@@ -547,7 +588,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     _,_,loss_mst = gaussians_init.stpr_to_graph()
                     loss += loss_mst * opt.lambda_mst
                 
-            loss_bind = gaussians_init.compute_gaussian_binding_loss(method='surface', plant_prior=args.plant_prior)
+            loss_bind = gaussians_init.compute_gaussian_binding_loss(method='surface', plant_prior="branch_only" if args.no_leaf_mode else args.plant_prior)
             loss += loss_bind * opt.lambda_bind
             loss.backward()
 
@@ -590,6 +631,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                         gaussians_init.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, flag=None)
+                    if args.background_prune_interval > 0 and iteration > opt.densify_from_iter and iteration % args.background_prune_interval == 0:
+                        scores, visible_count, used_cameras = gaussian_mask_visibility_scores(gaussians_init, scene.getTrainCameras(), args.device)
+                        if used_cameras > 0:
+                            prune_bg = (scores < args.background_prune_threshold) & (visible_count >= args.object_mask_min_views)
+                            if prune_bg.any() and prune_bg.sum() < prune_bg.shape[0]:
+                                print(f"[STAGE A] Pruning {int(prune_bg.sum().item())} background-supported gaussians.")
+                                gaussians_init.tmp_radii = torch.zeros((gaussians_init.get_xyz.shape[0],), device=args.device)
+                                gaussians_init.prune_points(prune_bg, flag=None)
                        
                     if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                         gaussians_init.reset_opacity()
@@ -597,7 +646,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 elif process_state == "stprs":
                     stprs.max_radii2D[visibility_filter] = torch.max(stprs.max_radii2D[visibility_filter], radii[visibility_filter])
                     stprs.add_densification_stats(viewspace_point_tensor, visibility_filter)
-                    if iteration > opt.densify_from_iter and iteration % opt.densification_interval:
+                    if args.stage_c_enable_densification and iteration > opt.densify_from_iter and iteration % opt.densification_interval:
                         if stprs._xyz.shape[0]<=args.max_stpr_num:
                             size_threshold = 30 if iteration > opt.opacity_reset_interval else None # size_threshold:20
                             stprs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, flag='stpr', size_threshold_small=None)
@@ -635,6 +684,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if process_state == "stprs":
                     stprs.optimizer.step()
                     stprs.optimizer.zero_grad(set_to_none = True)
+                    if appgs is not None:
+                        appgs.optimizer.zero_grad(set_to_none=True)
                 if process_state == "appgs":
                     appgs.optimizer.step()
                     appgs.optimizer.zero_grad(set_to_none = True)
@@ -761,6 +812,12 @@ if __name__ == "__main__":
     parser.add_argument("--stpr_min_scale_ratio", type=float, default=1e-5)
     parser.add_argument("--stpr_max_scale_ratio", type=float, default=0.5)
     parser.add_argument("--plant_prior", choices=["mixed", "branch_only"], default="mixed")
+    parser.add_argument("--no_leaf_mode", action="store_true", default=False)
+    parser.add_argument("--stage_a_iterations", type=int, default=7000)
+    parser.add_argument("--stage_c_iterations", type=int, default=1000)
+    parser.add_argument("--stage_c_enable_densification", action="store_true", default=False)
+    parser.add_argument("--background_prune_interval", type=int, default=0)
+    parser.add_argument("--background_prune_threshold", type=float, default=0.2)
     parser.add_argument('--gpu', type=int, default=0, help='Index of GPU device to use.')
     parser.add_argument("--reg_mask", action="store_true", default=False)
     parser.add_argument("--reg_align", action="store_true", default=False)

@@ -132,7 +132,7 @@ def don_func(gaussian,radius1, radius2,threshold, knn1,knn2,method='radius',vis_
         o3d.io.write_point_cloud("output/ficus/max_5000/point_cloud/iteration_7000/branch.ply", pcd_branch)
         o3d.io.write_point_cloud("output/ficus/max_5000/point_cloud/iteration_7000/leaf.ply", pcd_leaf)
 
-def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_cluster_points=100, save_prefix=None): 
+def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_cluster_points=100, save_prefix=None, force_branch=False): 
     from sklearn.cluster import DBSCAN
 
     # Dummy logic: let's just run DBSCAN to group roughly linear segments (can be seen as 'branches')
@@ -173,7 +173,10 @@ def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_clu
             point_colors[labels == label] = noise_color
             continue
 
-        if is_leaf(cluster_points):
+        if force_branch:
+            point_colors[labels == label] = branch_color
+            label_branch.append(label)
+        elif is_leaf(cluster_points):
             point_colors[labels == label] = leaf_color
             label_leaf.append(label)
         else:
