@@ -53,6 +53,42 @@ def render_alpha_approx(viewpoint_cam, gaussians, pipe, device):
     )
     return alpha_pkg["render"].mean(dim=0, keepdim=True).clamp(0.0, 1.0)
 
+def dilate_mask(mask, radius):
+    if radius <= 0:
+        return mask
+    kernel_size = 2 * radius + 1
+    return F.max_pool2d(mask.unsqueeze(0), kernel_size=kernel_size, stride=1, padding=radius).squeeze(0)
+
+def ramp_weight(iteration, target_weight, start_iter, end_iter):
+    if target_weight <= 0:
+        return 0.0
+    if iteration < start_iter:
+        return 0.0
+    if iteration >= end_iter:
+        return target_weight
+    denom = max(end_iter - start_iter, 1)
+    return target_weight * float(iteration - start_iter) / float(denom)
+
+def background_alpha_rgb_loss(viewpoint_cam, gaussians, image, bg, pipe, args, opt, iteration):
+    lambda_bg_alpha_eff = ramp_weight(
+        iteration,
+        opt.lambda_bg_alpha,
+        args.bg_alpha_ramp_start,
+        args.bg_alpha_ramp_end,
+    )
+    if not getattr(viewpoint_cam, "has_alpha_mask", False) or (lambda_bg_alpha_eff <= 0 and opt.lambda_bg_rgb <= 0):
+        return torch.tensor(0.0, device=args.device)
+
+    with torch.no_grad():
+        object_mask_bg = dilate_mask(viewpoint_cam.alpha_mask.to(args.device).clamp(0.0, 1.0), args.mask_dilate_radius)
+        outside_mask = (1.0 - object_mask_bg).clamp(0.0, 1.0)
+    outside_sum = outside_mask.sum().clamp(min=1.0)
+    rendered_alpha = render_alpha_approx(viewpoint_cam, gaussians, pipe, args.device)
+    bg_target = bg.view(-1, 1, 1) if bg.ndim == 1 else bg
+    outside_alpha_loss = (rendered_alpha * outside_mask).sum() / outside_sum
+    outside_rgb_loss = (torch.abs(image - bg_target) * outside_mask).sum() / (outside_sum * image.shape[0])
+    return lambda_bg_alpha_eff * outside_alpha_loss + opt.lambda_bg_rgb * outside_rgb_loss
+
 def render_semantic_object(viewpoint_cam, gaussians, pipe, device):
     semantic_color = gaussians.get_semantic.repeat(1, 3)
     semantic_pkg = render(
@@ -398,14 +434,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ssim_value = ssim(masked_image, masked_gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-            if mask is not None and (opt.lambda_bg_alpha > 0 or opt.lambda_bg_rgb > 0):
-                outside_mask = (1.0 - mask).clamp(0.0, 1.0)
-                outside_sum = outside_mask.sum().clamp(min=1.0)
-                rendered_alpha = render_alpha_approx(viewpoint_cam, gaussians_init, pipe, args.device)
-                bg_target = bg.view(-1, 1, 1) if bg.ndim == 1 else bg
-                outside_alpha_loss = (rendered_alpha * outside_mask).sum() / outside_sum
-                outside_rgb_loss = (torch.abs(image - bg_target) * outside_mask).sum() / (outside_sum * image.shape[0])
-                loss += opt.lambda_bg_alpha * outside_alpha_loss + opt.lambda_bg_rgb * outside_rgb_loss
+            loss += background_alpha_rgb_loss(viewpoint_cam, gaussians_init, image, bg, pipe, args, opt, iteration)
             if opt.lambda_obj_sem > 0:
                 loss += opt.lambda_obj_sem * object_semantic_loss(viewpoint_cam, gaussians_init, pipe, args.device)
             
@@ -535,14 +564,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ssim_value = ssim(masked_image, masked_gt_image)
             Ll1_stpr = masked_l1_loss(image_stprs, gt_image, mask) if mask is not None else l1_loss(image_stprs, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + 0.1 * Ll1_stpr
-            if mask is not None and (opt.lambda_bg_alpha > 0 or opt.lambda_bg_rgb > 0):
-                outside_mask = (1.0 - mask).clamp(0.0, 1.0)
-                outside_sum = outside_mask.sum().clamp(min=1.0)
-                rendered_alpha = render_alpha_approx(viewpoint_cam, appgs, pipe, args.device)
-                bg_target = bg.view(-1, 1, 1) if bg.ndim == 1 else bg
-                outside_alpha_loss = (rendered_alpha * outside_mask).sum() / outside_sum
-                outside_rgb_loss = (torch.abs(image - bg_target) * outside_mask).sum() / (outside_sum * image.shape[0])
-                loss += opt.lambda_bg_alpha * outside_alpha_loss + opt.lambda_bg_rgb * outside_rgb_loss
+            loss += background_alpha_rgb_loss(viewpoint_cam, appgs, image, bg, pipe, args, opt, iteration)
             if opt.lambda_obj_sem > 0:
                 loss += opt.lambda_obj_sem * object_semantic_loss(viewpoint_cam, appgs, pipe, args.device)
             # Depth regularization for stpr and appgs
@@ -818,6 +840,9 @@ if __name__ == "__main__":
     parser.add_argument("--stage_c_enable_densification", action="store_true", default=False)
     parser.add_argument("--background_prune_interval", type=int, default=0)
     parser.add_argument("--background_prune_threshold", type=float, default=0.2)
+    parser.add_argument("--mask_dilate_radius", type=int, default=3)
+    parser.add_argument("--bg_alpha_ramp_start", type=int, default=1000)
+    parser.add_argument("--bg_alpha_ramp_end", type=int, default=5000)
     parser.add_argument('--gpu', type=int, default=0, help='Index of GPU device to use.')
     parser.add_argument("--reg_mask", action="store_true", default=False)
     parser.add_argument("--reg_align", action="store_true", default=False)
