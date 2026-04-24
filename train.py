@@ -129,6 +129,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background       
+        # defaults for all training stages
+        Ll1 = torch.tensor(0.0, device=args.device)
+        Ll1depth_pure = 0.0
+
+        image = None
+        image_stprs = None
+
+        invDepth_appgs = None
+        invDepth_stprs = None
+        mono_invdepth = None
+
+        loss_align = 0.0
+        loss_overlap = 0.0
+        loss_freq = 0.0
+
+        loss_opacity_app = 0.0
+        loss_opacity_stprs = 0.0
+        loss_bind = 0.0
+        loss_mst = 0.0
+
+        num_appgs = 0
+        num_stprs = 0
         
 
         # stage 1: init

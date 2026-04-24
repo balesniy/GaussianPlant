@@ -382,13 +382,18 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             if group["name"] == name:
-                stored_state = self.optimizer.state.get(group['params'][0], None)
-                stored_state["exp_avg"] = torch.zeros_like(tensor)
-                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+                old_param = group["params"][0]
+                stored_state = self.optimizer.state.get(old_param, None)
 
-                del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
-                self.optimizer.state[group['params'][0]] = stored_state
+                if stored_state is not None:
+                    stored_state["exp_avg"] = torch.zeros_like(tensor)
+                    stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+
+                    del self.optimizer.state[old_param]
+                    group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+                    self.optimizer.state[group["params"][0]] = stored_state
+                else:
+                    group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
 
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
@@ -537,7 +542,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii,new_label,flag)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, flag=Literal['app','stprs'],only_prune=False,size_threshold_small=None):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, flag='stpr', only_prune=False, size_threshold_small=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
