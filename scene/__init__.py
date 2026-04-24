@@ -95,13 +95,15 @@ class Scene:
         if save_app and self.gaussians.appgs is not None:
             point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
             self.gaussians.appgs.save_ply(os.path.join(point_cloud_path, "apps.ply"))
-        if save_branch:
+        if save_branch and getattr(self.gaussians, "cylinder_mesh", None) is not None:
             branch = self.gaussians.cylinder_mesh
             branch_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
+            os.makedirs(branch_path, exist_ok=True)
             o3d.io.write_triangle_mesh(os.path.join(branch_path, "branch.ply"), branch)
-        if save_mst:
+        if save_mst and self.gaussians.structure_gs is not None:
             mst_edges, points,_ = self.gaussians.stpr_to_graph()
             save_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
+            os.makedirs(save_path, exist_ok=True)
             save_mst_ply(points, mst_edges, os.path.join(save_path, "mst.ply"))
         exposure_dict = {
             image_name: self.gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
