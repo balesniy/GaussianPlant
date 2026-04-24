@@ -737,7 +737,7 @@ class GaussianModel:
         # stpr_rotations = np.roll(np.array(stpr_rotations), 1, axis=1)
         stpr_positions = torch.tensor(np.array(stpr_positions), dtype=torch.float, device=self.device)
         stpr_scales = torch.tensor(np.array(stpr_scales), dtype=torch.float, device=self.device)
-        stpr_rotations = torch.tensor(stpr_rotations, dtype=torch.float, device=self.device)
+        stpr_rotations = torch.tensor(np.array(stpr_rotations), dtype=torch.float, device=self.device)
         stpr_features_dc = torch.tensor(np.array(stpr_features_dc), dtype=torch.float, device=self.device)
         stpr_features_rest = torch.tensor(np.array(stpr_features_rest), dtype=torch.float, device=self.device)
         # stpr_opacities = torch.tensor(stpr_opacities, dtype=torch.float, device=self.device)
@@ -881,7 +881,7 @@ class GaussianModel:
         v1 = v1 - (torch.sum(v1 * A, dim=-1, keepdim=True) * A)
         v1 = v1 / torch.norm(v1, dim=-1, keepdim=True)
 
-        v2 = torch.cross(A, v1)  # Get the second orthogonal vector
+        v2 = torch.cross(A, v1, dim=-1)  # Get the second orthogonal vector
 
         # Compute the points on the circles
         top_center = C + (H[:, None] / 2) * A

@@ -225,7 +225,7 @@ def z_axis_to_vector_rotation_torch(target_vector: torch.Tensor, target: str = '
     else:
         raise ValueError("target must be 'gs' or 'cylinder'")
     z_axis =z_axis.unsqueeze(0).repeat(target_vector.shape[0], 1)
-    v = torch.cross(z_axis, target_vector)
+    v = torch.cross(z_axis, target_vector, dim=-1)
     c = torch.sum(z_axis *target_vector)
 
     if torch.isclose(c, torch.tensor(1.0, device=target_vector.device)):
@@ -427,13 +427,13 @@ def gs_to_disk_distance(
 
     # 构平面的局部坐标基 e1,e2
     tmp = torch.tensor([1.,0.,0.], device=xyz.device).expand_as(n)
-    e1 = F.normalize(torch.cross(n, tmp), dim=-1)
+    e1 = F.normalize(torch.cross(n, tmp, dim=-1), dim=-1)
     # 当 n≈x 轴时，用 y 轴生成
     bad = torch.isnan(e1).any(dim=-1)
     if bad.any():
         tmp2 = torch.tensor([0.,1.,0.], device=xyz.device).expand_as(n[bad])
-        e1[bad] = F.normalize(torch.cross(n[bad], tmp2), dim=-1)
-    e2 = torch.cross(n, e1)
+        e1[bad] = F.normalize(torch.cross(n[bad], tmp2, dim=-1), dim=-1)
+    e2 = torch.cross(n, e1, dim=-1)
 
     # 坐标 (x',y') in disk plane
     x_coord = torch.sum(v * e1, dim=-1)
@@ -472,7 +472,7 @@ def align_Z_to_u(u: torch.Tensor) -> torch.Tensor:
     输入单位向量 u (…,3)，返回 3×3 旋转矩阵，把局部 (0,0,1) 转到 u。
     """
     z = torch.tensor([0.,0.,1.], device=u.device, dtype=u.dtype)
-    v = torch.cross(z, u)
+    v = torch.cross(z, u, dim=-1)
     c = torch.sum(z * u, dim=-1, keepdim=True)        # cosθ
     s = torch.norm(v, dim=-1, keepdim=True)           # sinθ
     # R = I + [v]_x + [v]_x^2 * ((1-c)/s^2)
@@ -498,7 +498,7 @@ def stpr_to_cylinder(p, S, R,save_flag=True,resolution=32):
         mesh_all = o3d.geometry.TriangleMesh()
         for i in range(p.shape[0]):
             mesh = o3d.geometry.TriangleMesh.create_cylinder(
-                radius=float(r[i]), height=float(h[i]),
+                radius=float(r[i].detach()), height=float(h[i].detach()),
                 resolution=resolution, split=20)
             u = rot_matrix[i,:,0]                            # 目标主轴
             R_align = align_Z_to_u(u)
