@@ -54,7 +54,7 @@ def find_checkpoint_pair(checkpoint):
     return None
 
 def restore_child_gaussians(checkpoint, dataset, opt, reference_gaussians):
-    model_params, iteration = torch.load(checkpoint)
+    model_params, iteration = torch.load(checkpoint, weights_only=False)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type, reference_gaussians.device)
     gaussians.exposure_mapping = reference_gaussians.exposure_mapping
     gaussians.pretrained_exposures = reference_gaussians.pretrained_exposures
@@ -90,7 +90,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians_init.update_nn_between_appgs_and_stprs()
             process_state = 'appgs'
         else:
-            (model_params, first_iter) = torch.load(checkpoint)
+            (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
             gaussians_init.restore(model_params, opt)
             process_state = 'init'
 
