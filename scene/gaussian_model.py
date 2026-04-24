@@ -1486,7 +1486,7 @@ class GaussianModel:
         branch_pos   = self.structure_gs.get_xyz[branch_mask]
         branch_scale = self.structure_gs.get_scaling[branch_mask]
         branch_rot   = self.structure_gs.get_rotation[branch_mask]
-        cyl_param , cylinder_mesh= stpr_to_cylinder(branch_pos, branch_scale, branch_rot, save_flag=True)
+        cyl_param , cylinder_mesh= stpr_to_cylinder(branch_pos, branch_scale, branch_rot, save_flag=False)
         self.cylinder_mesh = cylinder_mesh
 
         leaf_mask_app   = torch.tensor([lbl == 'leaf'   for lbl in self.appgs.app_label], device=self.device)
