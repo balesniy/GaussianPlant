@@ -203,7 +203,24 @@ class GaussianModel:
 
     @property
     def get_mask(self):
+        self._ensure_mask_shape()
         return self._mask
+
+    def _ensure_mask_shape(self, expected_count=None):
+        if expected_count is None:
+            expected_count = self._xyz.shape[0]
+        device = self.device if self.device is not None else self._xyz.device
+        if self._mask.numel() == expected_count:
+            return
+        if self._mask.numel() == 0:
+            self._mask = torch.ones((expected_count,), dtype=torch.float, device=device)
+            return
+        mask = self._mask.detach().to(device)
+        if mask.numel() > expected_count:
+            self._mask = mask[:expected_count].clone()
+        else:
+            padding = torch.ones((expected_count - mask.numel(),), dtype=mask.dtype, device=device)
+            self._mask = torch.cat((mask, padding), dim=0)
 
     def opacity_regularizer(self):
         return torch.mean(self.get_opacity * (1 - self.get_opacity))
@@ -361,6 +378,7 @@ class GaussianModel:
 
     def clone_subset(self, keep_mask, copy_structure_metadata=False):
         keep_mask = keep_mask.to(self.device).bool()
+        self._ensure_mask_shape(keep_mask.shape[0])
         clone = GaussianModel(sh_degree=self.max_sh_degree, optimizer_type=self.optimizer_type, device=self.device)
         clone.active_sh_degree = self.active_sh_degree
         clone.spatial_lr_scale = self.spatial_lr_scale
@@ -371,7 +389,7 @@ class GaussianModel:
         clone._semantic_logit = nn.Parameter(self._semantic_logit.detach()[keep_mask].clone().requires_grad_(True)) if self._semantic_logit is not None else nn.Parameter(torch.zeros((int(keep_mask.sum().item()), 1), dtype=torch.float, device=self.device).requires_grad_(True))
         clone._scaling = nn.Parameter(self._scaling.detach()[keep_mask].clone().requires_grad_(True))
         clone._rotation = nn.Parameter(self._rotation.detach()[keep_mask].clone().requires_grad_(True))
-        clone._mask = self._mask.detach()[keep_mask].clone() if self._mask.numel() else torch.ones((int(keep_mask.sum().item()),), dtype=torch.float, device=self.device)
+        clone._mask = self._mask.detach()[keep_mask].clone()
         clone.max_radii2D = torch.zeros((clone.get_xyz.shape[0]), device=self.device)
         clone.xyz_gradient_accum = torch.zeros((clone.get_xyz.shape[0], 1), device=self.device)
         clone.denom = torch.zeros((clone.get_xyz.shape[0], 1), device=self.device)
@@ -502,6 +520,7 @@ class GaussianModel:
 
     def prune_points(self, mask,flag=Literal['app','stpr']):
         valid_points_mask = ~mask
+        self._ensure_mask_shape(valid_points_mask.shape[0])
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._xyz = optimizable_tensors["xyz"]
@@ -526,6 +545,7 @@ class GaussianModel:
             assert len(self.stpr_label) == self.get_xyz.shape[0]
             if self._pst_logit is not None:
                 self._pst_logit = optimizable_tensors["pst"]
+        self._mask = self._mask[valid_points_mask].clone()
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
 
@@ -552,6 +572,7 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_label=None, flag=None, new_pst_logit=None, new_semantic=None):
+        self._ensure_mask_shape()
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -573,6 +594,8 @@ class GaussianModel:
         if "pst" in optimizable_tensors:
             self._pst_logit = optimizable_tensors["pst"]
 
+        new_mask = torch.ones((new_xyz.shape[0],), dtype=self._mask.dtype, device=self._mask.device)
+        self._mask = torch.cat((self._mask, new_mask), dim=0)
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         if flag == 'app':
             self.app_label.extend(new_label)
