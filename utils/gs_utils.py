@@ -594,24 +594,25 @@ def gs_to_cylinder_distance(
 ) -> torch.Tensor:                          # 返回 (M,) 距离
     C = cyl_param['center'][parent]         # (M,3)
     u = cyl_param['axis'][parent]           # (M,3) 已归一化
-    r = cyl_param['radius'][parent]         # (M,)
-    h = cyl_param['half_len'][parent]       # (M,)
+    r = cyl_param['radius'][parent].view(-1, 1)         # (M,1)
+    h = cyl_param['half_len'][parent].view(-1, 1)       # (M,1)
     C = C.squeeze(1)  
     u = u.squeeze(1)  
     v   = xyz - C                           # (M,3)
     t   = torch.sum(v * u, dim=-1)          # 投影到轴坐标
+    t_abs = t.abs().unsqueeze(1)
     t_c = torch.clamp(t.unsqueeze(1), -h, h)             # 夹到端盖内
     P_a = C + t_c * u         # 轴上最近点
     d_side = torch.norm(xyz - P_a, dim=-1).unsqueeze(1) - r
     d_side = torch.clamp(d_side, min=0.0)   # 侧壁距离 (负值→0)
 
     # 端盖外侧的距离
-    cap_mask = (t.abs().unsqueeze(1) > h)
+    cap_mask = (t_abs > h)
     d_cap = torch.sqrt(
-        d_side[cap_mask]**2 + (t.abs().unsqueeze(1)[cap_mask]-h[cap_mask])**2
+        d_side[cap_mask]**2 + (t_abs[cap_mask]-h[cap_mask])**2
     )
     d_side[cap_mask] = d_cap
-    return d_side                           # (M,)
+    return d_side.view(-1)                  # (M,)
 
 
 # ────────────────────────────────────────────────────────────
