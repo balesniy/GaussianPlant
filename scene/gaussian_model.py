@@ -24,13 +24,14 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scipy.spatial.transform import Rotation as R
 from sklearn.cluster import KMeans
 import faiss
+import open3d as o3d
 from pytorch3d.transforms import quaternion_to_matrix, quaternion_invert, quaternion_apply, matrix_to_quaternion
 from pytorch3d.ops import knn_points, estimate_pointcloud_normals
 import networkx as nx
 from scipy.spatial import cKDTree
 from plyfile import PlyData, PlyElement
 import trimesh
-from utils.gs_utils import fit_cylinder_ransac, estimate_gs_para_from_cluster, branch_to_cylinder, leaf_to_disk, stpr_to_cylinder, gs_to_disk_distance, gs_to_cylinder_distance, stpr_to_disk, build_edge, build_mst_from_endpoints,save_mst_ply
+from utils.gs_utils import fit_cylinder_ransac, estimate_gs_para_from_cluster, branch_to_cylinder, leaf_to_disk, stpr_to_cylinder, gs_to_disk_distance, gs_to_cylinder_distance, stpr_to_disk, build_edge, build_mst_from_endpoints,save_mst_ply, is_leaf
 import time
 from utils.loss_utils import mst_loss
 
@@ -709,7 +710,8 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    def build_stprs_from_gs(self, num_clusters=100,method: Literal['kmeans', 'random', '3dgs'] = '3dgs', min_cluster_points=100,
+    def build_stprs_from_gs(self, num_clusters=100,method: Literal['kmeans', 'random', '3dgs', 'feature_kmeans'] = '3dgs', min_cluster_points=100,
+                            point_features=None, stpr_feature_weight=1.0, stpr_xyz_weight=0.25,
                             scene_extent=None, stpr_min_scale_ratio=1e-5, stpr_max_scale_ratio=0.5,
                             debug_dir=None, plant_prior="mixed", no_leaf_mode=False,
                             stpr_dbscan_eps=0.005, stpr_dbscan_min_samples=5,
@@ -776,30 +778,90 @@ class GaussianModel:
                 stpr_rotations.append(stpr_rot)
         elif method == 'random':
             pass
-        elif method == '3dgs':
+        elif method in ('3dgs', 'feature_kmeans'):
             """
             Build structural primitives (StPrs) from optimized Gaussians using 3D Gaussian clustering.
             Using segmented leaf&branch points information for initialize leaf stpr(disk) and branch stpr(cylinder).
             """
-            label_leaf, label_branch, labels = fit_cylinder_ransac(
-                xyz,
-                eps=stpr_dbscan_eps,
-                min_samples=stpr_dbscan_min_samples,
-                save_ply=debug_dir is not None,
-                min_cluster_points=min_cluster_points,
-                save_prefix=os.path.join(debug_dir, "fit_cylinder_ransac") if debug_dir else None,
-                force_branch=no_leaf_mode,
-                geometry_refine=geometry_refine_labels,
-                geometry_knn=geometry_knn,
-                geometry_cost_threshold=geometry_cost_threshold,
-                geometry_max_dist_factor=geometry_max_dist_factor,
-                geometry_axis_threshold=geometry_axis_threshold,
-                geometry_tangent_threshold=geometry_tangent_threshold,
-                geometry_radius_threshold=geometry_radius_threshold,
-                geometry_radius_graph_r=geometry_radius_graph_r,
-                scene_extent=scene_extent,
-            )
-            print(f"[DEBUG][ransac] num ransac labels={len(np.unique(labels))} num leaf labels={len(label_leaf)} num branch labels={len(label_branch)}")
+            if method == 'feature_kmeans':
+                if point_features is None:
+                    raise ValueError("feature_kmeans requires point_features")
+                point_features = np.asarray(point_features, dtype=np.float32)
+                if point_features.shape[0] != xyz.shape[0]:
+                    raise ValueError(f"point_features has {point_features.shape[0]} rows, expected {xyz.shape[0]}")
+
+                xyz_center = xyz.mean(axis=0, keepdims=True)
+                xyz_scale = scene_extent if scene_extent is not None and scene_extent > 0 else np.linalg.norm(xyz.max(axis=0) - xyz.min(axis=0))
+                xyz_norm = (xyz - xyz_center) / max(float(xyz_scale), 1e-6)
+                feat_mean = point_features.mean(axis=0, keepdims=True)
+                feat_std = point_features.std(axis=0, keepdims=True) + 1e-6
+                feat_norm = (point_features - feat_mean) / feat_std
+                feat_norm /= np.linalg.norm(feat_norm, axis=1, keepdims=True) + 1e-6
+                cluster_features = np.hstack((stpr_xyz_weight * xyz_norm, stpr_feature_weight * feat_norm)).astype(np.float32)
+                k = max(1, min(num_clusters, xyz.shape[0] // max(min_cluster_points, 1)))
+                print(
+                    f"[DEBUG][feature-kmeans] points={xyz.shape[0]} feature_dim={point_features.shape[1]} "
+                    f"k={k} xyz_weight={stpr_xyz_weight} feature_weight={stpr_feature_weight}"
+                )
+                kmeans = faiss.Kmeans(d=cluster_features.shape[1], k=k, niter=25, nredo=3, gpu=True)
+                kmeans.train(cluster_features)
+                labels = kmeans.index.search(cluster_features, 1)[1].flatten()
+
+                unique_labels = set(labels)
+                label_leaf = []
+                label_branch = []
+                point_colors = np.full((xyz.shape[0], 3), 0.7, dtype=np.float32)
+                rng = np.random.default_rng(0)
+                colors = rng.random((len(unique_labels), 3), dtype=np.float32)
+                used_points = 0
+                small_cluster_points = 0
+                for color_idx, label in enumerate(sorted(unique_labels)):
+                    cluster_points = xyz[labels == label]
+                    if len(cluster_points) < min_cluster_points:
+                        small_cluster_points += len(cluster_points)
+                        continue
+                    used_points += len(cluster_points)
+                    if no_leaf_mode:
+                        point_colors[labels == label] = [1.0, 0.0, 0.0]
+                        label_branch.append(label)
+                    elif is_leaf(cluster_points):
+                        point_colors[labels == label] = [0.0, 1.0, 0.0]
+                        label_leaf.append(label)
+                    else:
+                        point_colors[labels == label] = [1.0, 0.0, 0.0]
+                        label_branch.append(label)
+                    colors[color_idx] = point_colors[labels == label][0]
+                if debug_dir is not None:
+                    pcd = o3d.geometry.PointCloud()
+                    pcd.points = o3d.utility.Vector3dVector(xyz)
+                    pcd.colors = o3d.utility.Vector3dVector(point_colors)
+                    o3d.io.write_point_cloud(os.path.join(debug_dir, "feature_kmeans_leaf_branch.ply"), pcd)
+                print(
+                    f"[DEBUG][feature-kmeans] clusters={len(unique_labels)} valid_clusters={len(label_leaf) + len(label_branch)} "
+                    f"small_cluster_points={small_cluster_points}/{xyz.shape[0]} "
+                    f"used_points={used_points}/{xyz.shape[0]} ({used_points / max(xyz.shape[0], 1):.1%}) "
+                    f"leaf={len(label_leaf)} branch={len(label_branch)}"
+                )
+            else:
+                label_leaf, label_branch, labels = fit_cylinder_ransac(
+                    xyz,
+                    eps=stpr_dbscan_eps,
+                    min_samples=stpr_dbscan_min_samples,
+                    save_ply=debug_dir is not None,
+                    min_cluster_points=min_cluster_points,
+                    save_prefix=os.path.join(debug_dir, "fit_cylinder_ransac") if debug_dir else None,
+                    force_branch=no_leaf_mode,
+                    geometry_refine=geometry_refine_labels,
+                    geometry_knn=geometry_knn,
+                    geometry_cost_threshold=geometry_cost_threshold,
+                    geometry_max_dist_factor=geometry_max_dist_factor,
+                    geometry_axis_threshold=geometry_axis_threshold,
+                    geometry_tangent_threshold=geometry_tangent_threshold,
+                    geometry_radius_threshold=geometry_radius_threshold,
+                    geometry_radius_graph_r=geometry_radius_graph_r,
+                    scene_extent=scene_extent,
+                )
+                print(f"[DEBUG][ransac] num ransac labels={len(np.unique(labels))} num leaf labels={len(label_leaf)} num branch labels={len(label_branch)}")
             index = 0
             for i,label in enumerate(np.unique(labels)):
                 if label in label_leaf:

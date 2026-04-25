@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn.functional as F
+import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim,  align_loss
 from gaussian_renderer import render, network_gui
@@ -191,6 +192,105 @@ def gaussian_projects_inside_mask(gaussians, camera, device, threshold=0.5):
     result[in_bounds] = sampled >= threshold
     return result
 
+def find_feature_map_path(feature_dir, image_name):
+    names = [image_name, os.path.splitext(image_name)[0]]
+    exts = ["", ".pt", ".pth", ".npy", ".npz"]
+    for name in names:
+        for ext in exts:
+            path = os.path.join(feature_dir, name + ext)
+            if os.path.exists(path):
+                return path
+    return None
+
+def load_feature_map(path, device, layout="auto"):
+    if path.endswith((".pt", ".pth")):
+        data = torch.load(path, map_location="cpu")
+        if isinstance(data, dict):
+            for key in ("features", "feature", "feature_map", "feat", "x"):
+                if key in data:
+                    data = data[key]
+                    break
+        fmap = torch.as_tensor(data)
+    elif path.endswith(".npz"):
+        data = np.load(path)
+        key = "features" if "features" in data else data.files[0]
+        fmap = torch.from_numpy(data[key])
+    else:
+        fmap = torch.from_numpy(np.load(path))
+
+    if fmap.ndim == 4 and fmap.shape[0] == 1:
+        fmap = fmap.squeeze(0)
+    if fmap.ndim != 3:
+        raise ValueError(f"Expected 3D feature map, got shape {tuple(fmap.shape)} at {path}")
+    if layout == "chw":
+        return fmap.float().to(device)
+    if layout == "hwc":
+        return fmap.permute(2, 0, 1).contiguous().float().to(device)
+    if fmap.shape[-1] <= 8:
+        return fmap.permute(2, 0, 1).contiguous().float().to(device)
+    if fmap.shape[0] <= 8 or fmap.shape[0] > max(fmap.shape[1], fmap.shape[2]):
+        return fmap.float().to(device)
+    return fmap.permute(2, 0, 1).contiguous().float().to(device)
+
+def aggregate_projected_features(gaussians, cameras, args):
+    if args.stpr_cluster_method == "3dgs":
+        return None
+
+    xyz = gaussians.get_xyz.detach()
+    feat_sum = None
+    feat_count = torch.zeros((xyz.shape[0], 1), dtype=torch.float32, device=args.device)
+    used_cameras = 0
+    missing_maps = 0
+    cameras_to_use = cameras[:args.stpr_feature_max_cameras]
+
+    for camera in cameras_to_use:
+        if args.stpr_feature_source == "image_rgb":
+            fmap = camera.original_image.to(args.device)
+        else:
+            fmap_path = find_feature_map_path(args.stpr_feature_dir, camera.image_name)
+            if fmap_path is None:
+                missing_maps += 1
+                continue
+            fmap = load_feature_map(fmap_path, args.device, args.stpr_feature_layout)
+
+        if feat_sum is None:
+            feat_sum = torch.zeros((xyz.shape[0], fmap.shape[0]), dtype=torch.float32, device=args.device)
+
+        x, y, in_bounds = project_gaussians_to_camera(xyz, camera)
+        if not in_bounds.any():
+            continue
+        grid_x = (x[in_bounds] / max(camera.image_width - 1, 1)) * 2.0 - 1.0
+        grid_y = (y[in_bounds] / max(camera.image_height - 1, 1)) * 2.0 - 1.0
+        grid = torch.stack([grid_x, grid_y], dim=-1).view(1, -1, 1, 2)
+
+        if getattr(camera, "has_alpha_mask", False):
+            mask = camera.alpha_mask.to(args.device).unsqueeze(0)
+            visible = F.grid_sample(mask, grid, align_corners=True).view(-1) >= args.stpr_feature_mask_threshold
+        else:
+            visible = torch.ones((grid.shape[1],), dtype=torch.bool, device=args.device)
+        if not visible.any():
+            continue
+
+        sampled = F.grid_sample(fmap.unsqueeze(0), grid[:, visible], align_corners=True).squeeze(0).squeeze(-1).T
+        point_idx = torch.nonzero(in_bounds, as_tuple=False).view(-1)[visible]
+        feat_sum[point_idx] += sampled
+        feat_count[point_idx] += 1.0
+        used_cameras += 1
+
+    if feat_sum is None or used_cameras == 0:
+        print("[WARN][features] no feature maps were loaded; falling back to 3DGS DBSCAN clustering.")
+        return None
+
+    valid = feat_count.view(-1) >= args.stpr_feature_min_views
+    features = feat_sum / feat_count.clamp(min=1.0)
+    features[~valid] = 0.0
+    print(
+        f"[DEBUG][features] source={args.stpr_feature_source} used_cameras={used_cameras} "
+        f"missing_maps={missing_maps} feature_dim={features.shape[1]} "
+        f"valid_points={int(valid.sum().item())}/{xyz.shape[0]}"
+    )
+    return features.detach().cpu().numpy()
+
 def find_checkpoint_pair(checkpoint):
     root, ext = os.path.splitext(checkpoint)
     if ext != ".pth":
@@ -323,10 +423,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 log_pipeline_stats("object-filtered 3DGS", gaussians_for_stpr, scene.cameras_extent)
                 n_points_for_stpr = gaussians_for_stpr.get_xyz.shape[0]
                 num_clusters = max(args.stpr_min_clusters, min(args.stpr_max_clusters, max(1, n_points_for_stpr // 100)))
+                point_features = aggregate_projected_features(gaussians_for_stpr, scene.getTrainCameras(), args)
+                stpr_cluster_method = args.stpr_cluster_method if point_features is not None else "3dgs"
                 stprs,appgs = gaussians_for_stpr.build_stprs_from_gs(
                     num_clusters=num_clusters,
-                    method='3dgs',
+                    method=stpr_cluster_method,
                     min_cluster_points=args.min_cluster_points,
+                    point_features=point_features,
+                    stpr_feature_weight=args.stpr_feature_weight,
+                    stpr_xyz_weight=args.stpr_xyz_weight,
                     scene_extent=scene.cameras_extent,
                     stpr_min_scale_ratio=args.stpr_min_scale_ratio,
                     stpr_max_scale_ratio=args.stpr_max_scale_ratio,
@@ -837,8 +942,17 @@ if __name__ == "__main__":
     parser.add_argument("--tb_image_interval", type=int, default=1000)
     parser.add_argument("--neighbor_update_interval", type=int, default=50)
     parser.add_argument("--min_cluster_points", type=int, default=100)
+    parser.add_argument("--stpr_cluster_method", choices=["3dgs", "feature_kmeans"], default="3dgs")
     parser.add_argument("--stpr_dbscan_eps", type=float, default=0.0)
     parser.add_argument("--stpr_dbscan_min_samples", type=int, default=5)
+    parser.add_argument("--stpr_feature_source", choices=["precomputed", "image_rgb"], default="precomputed")
+    parser.add_argument("--stpr_feature_dir", type=str, default="")
+    parser.add_argument("--stpr_feature_layout", choices=["auto", "chw", "hwc"], default="auto")
+    parser.add_argument("--stpr_feature_weight", type=float, default=1.0)
+    parser.add_argument("--stpr_xyz_weight", type=float, default=0.25)
+    parser.add_argument("--stpr_feature_max_cameras", type=int, default=32)
+    parser.add_argument("--stpr_feature_min_views", type=int, default=1)
+    parser.add_argument("--stpr_feature_mask_threshold", type=float, default=0.5)
     parser.add_argument("--object_mask_threshold", type=float, default=0.5)
     parser.add_argument("--object_mask_min_views", type=int, default=1)
     parser.add_argument("--stpr_min_clusters", type=int, default=10)
