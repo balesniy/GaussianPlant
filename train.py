@@ -233,7 +233,7 @@ def load_feature_map(path, device, layout="auto"):
     return fmap.permute(2, 0, 1).contiguous().float().to(device)
 
 def aggregate_projected_features(gaussians, cameras, args):
-    if args.stpr_cluster_method == "3dgs":
+    if args.stpr_cluster_method != "feature_kmeans":
         return None
 
     xyz = gaussians.get_xyz.detach()
@@ -290,6 +290,98 @@ def aggregate_projected_features(gaussians, cameras, args):
         f"valid_points={int(valid.sum().item())}/{xyz.shape[0]}"
     )
     return features.detach().cpu().numpy()
+
+def get_view_feature_map(viewpoint_cam, args):
+    if args.stpr_feature_source == "image_rgb":
+        fmap = viewpoint_cam.original_image.to(args.device)
+    else:
+        if not hasattr(args, "_feature_map_cache"):
+            args._feature_map_cache = {}
+        fmap_path = find_feature_map_path(args.stpr_feature_dir, viewpoint_cam.image_name)
+        if fmap_path is None:
+            return None
+        if fmap_path not in args._feature_map_cache:
+            args._feature_map_cache[fmap_path] = load_feature_map(fmap_path, args.device, args.stpr_feature_layout).clamp(0.0, 1.0)
+        fmap = args._feature_map_cache[fmap_path]
+    if args.stpr_semantic_dim > 0 and fmap.shape[0] != args.stpr_semantic_dim:
+        dim = min(fmap.shape[0], args.stpr_semantic_dim)
+        fmap = fmap[:dim]
+    return fmap
+
+def semantic_feature_render_loss(viewpoint_cam, gaussians, pipe, args):
+    if args.lambda_dino_sem <= 0 or gaussians is None or not gaussians._semantic_feature.numel():
+        return torch.tensor(0.0, device=args.device)
+    target = get_view_feature_map(viewpoint_cam, args)
+    if target is None:
+        return torch.tensor(0.0, device=args.device)
+
+    dim = min(target.shape[0], gaussians._semantic_feature.shape[1])
+    if dim <= 0:
+        return torch.tensor(0.0, device=args.device)
+    mask = viewpoint_cam.alpha_mask.to(args.device) if getattr(viewpoint_cam, "has_alpha_mask", False) else None
+    denom = mask.sum().clamp(min=1.0) if mask is not None else torch.tensor(float(target.shape[-1] * target.shape[-2]), device=args.device)
+    sem = torch.sigmoid(gaussians._semantic_feature[:, :dim])
+    losses = []
+    for start in range(0, dim, 3):
+        end = min(start + 3, dim)
+        colors = torch.zeros((sem.shape[0], 3), dtype=sem.dtype, device=args.device)
+        colors[:, :end - start] = sem[:, start:end]
+        rendered = render(viewpoint_cam, gaussians, pipe, torch.zeros((3), dtype=torch.float32, device=args.device), override_color=colors, separate_sh=False)["render"][:end - start]
+        tgt = target[start:end]
+        if mask is not None:
+            losses.append((torch.abs(rendered - tgt) * mask).sum() / (denom * (end - start)))
+        else:
+            losses.append(torch.abs(rendered - tgt).mean())
+    return torch.stack(losses).mean()
+
+def load_semantic_prototype(path, args):
+    if not path:
+        return None
+    if not hasattr(args, "_semantic_proto_cache"):
+        args._semantic_proto_cache = {}
+    if path in args._semantic_proto_cache:
+        return args._semantic_proto_cache[path]
+    if path.endswith((".pt", ".pth")):
+        data = torch.load(path, map_location="cpu")
+        if isinstance(data, dict):
+            data = data.get("feature", data.get("features", next(iter(data.values()))))
+        proto = torch.as_tensor(data, dtype=torch.float32, device=args.device).view(-1)
+    else:
+        proto = torch.from_numpy(np.load(path)).float().to(args.device).view(-1)
+    args._semantic_proto_cache[path] = proto
+    return proto
+
+def stpr_semantic_prototype_loss(gaussians_root, args):
+    if args.lambda_stpr_sem_proto <= 0 or gaussians_root.appgs is None or gaussians_root.structure_gs is None:
+        return torch.tensor(0.0, device=args.device)
+    app_feat = gaussians_root.appgs._semantic_feature
+    stprs = gaussians_root.structure_gs
+    if not app_feat.numel() or stprs._pst_logit is None or gaussians_root.nn_stpr_appgs is None:
+        return torch.tensor(0.0, device=args.device)
+    leaf_proto = load_semantic_prototype(args.stpr_leaf_proto, args)
+    branch_proto = load_semantic_prototype(args.stpr_branch_proto, args)
+    if leaf_proto is None or branch_proto is None:
+        return torch.tensor(0.0, device=args.device)
+
+    dim = min(app_feat.shape[1], leaf_proto.numel(), branch_proto.numel())
+    if isinstance(gaussians_root.nn_stpr_appgs, list):
+        parent = torch.stack(gaussians_root.nn_stpr_appgs, dim=0).to(args.device).view(-1)
+    else:
+        parent = gaussians_root.nn_stpr_appgs.to(args.device).view(-1)
+    app_sem = torch.sigmoid(app_feat[:, :dim])
+    st_feat = torch.zeros((stprs.get_xyz.shape[0], dim), dtype=app_sem.dtype, device=args.device)
+    counts = torch.zeros((stprs.get_xyz.shape[0], 1), dtype=app_sem.dtype, device=args.device)
+    st_feat.index_add_(0, parent, app_sem)
+    counts.index_add_(0, parent, torch.ones((parent.shape[0], 1), dtype=app_sem.dtype, device=args.device))
+    st_feat = st_feat / counts.clamp(min=1.0)
+
+    leaf_proto = F.normalize(leaf_proto[:dim].view(1, -1), dim=-1)
+    branch_proto = F.normalize(branch_proto[:dim].view(1, -1), dim=-1)
+    st_norm = F.normalize(st_feat, dim=-1)
+    logits = torch.cat([(st_norm * leaf_proto).sum(dim=-1, keepdim=True), (st_norm * branch_proto).sum(dim=-1, keepdim=True)], dim=-1)
+    p_branch = torch.sigmoid(stprs._pst_logit).view(-1)
+    log_probs = F.log_softmax(logits / max(args.stpr_semantic_temperature, 1e-6), dim=-1)
+    return -((1.0 - p_branch) * log_probs[:, 0] + p_branch * log_probs[:, 1]).mean()
 
 def find_checkpoint_pair(checkpoint):
     root, ext = os.path.splitext(checkpoint)
@@ -424,7 +516,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 n_points_for_stpr = gaussians_for_stpr.get_xyz.shape[0]
                 num_clusters = max(args.stpr_min_clusters, min(args.stpr_max_clusters, max(1, n_points_for_stpr // 100)))
                 point_features = aggregate_projected_features(gaussians_for_stpr, scene.getTrainCameras(), args)
-                stpr_cluster_method = args.stpr_cluster_method if point_features is not None else "3dgs"
+                stpr_cluster_method = args.stpr_cluster_method
+                if args.stpr_cluster_method == "feature_kmeans" and point_features is None:
+                    stpr_cluster_method = "coarse_kmeans"
                 stprs,appgs = gaussians_for_stpr.build_stprs_from_gs(
                     num_clusters=num_clusters,
                     method=stpr_cluster_method,
@@ -432,6 +526,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     point_features=point_features,
                     stpr_feature_weight=args.stpr_feature_weight,
                     stpr_xyz_weight=args.stpr_xyz_weight,
+                    stpr_appgs_per_stpr=args.stpr_appgs_per_stpr,
+                    stpr_semantic_dim=args.stpr_semantic_dim,
                     scene_extent=scene.cameras_extent,
                     stpr_min_scale_ratio=args.stpr_min_scale_ratio,
                     stpr_max_scale_ratio=args.stpr_max_scale_ratio,
@@ -614,6 +710,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
             if opt.lambda_obj_sem > 0:
                 loss += opt.lambda_obj_sem * object_semantic_loss(viewpoint_cam, stprs, pipe, args.device)
+            if args.lambda_dino_sem > 0:
+                loss += args.lambda_dino_sem * semantic_feature_render_loss(viewpoint_cam, stprs, pipe, args)
             # Depth regularization
             Ll1depth_pure = 0.0
             invDepth = None
@@ -682,6 +780,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += background_alpha_rgb_loss(viewpoint_cam, appgs, image, bg, pipe, args, opt, iteration)
             if opt.lambda_obj_sem > 0:
                 loss += opt.lambda_obj_sem * object_semantic_loss(viewpoint_cam, appgs, pipe, args.device)
+            if args.lambda_dino_sem > 0:
+                loss += args.lambda_dino_sem * semantic_feature_render_loss(viewpoint_cam, appgs, pipe, args)
             # Depth regularization for stpr and appgs
             Ll1depth_pure = 0.0
             invDepth_appgs = None
@@ -727,6 +827,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 
             loss_bind = gaussians_init.compute_gaussian_binding_loss(method='surface', plant_prior="branch_only" if args.no_leaf_mode else args.plant_prior)
             loss += loss_bind * opt.lambda_bind
+            if args.lambda_stpr_sem_proto > 0:
+                loss += args.lambda_stpr_sem_proto * stpr_semantic_prototype_loss(gaussians_init, args)
             loss.backward()
 
         iter_end.record()
@@ -942,7 +1044,8 @@ if __name__ == "__main__":
     parser.add_argument("--tb_image_interval", type=int, default=1000)
     parser.add_argument("--neighbor_update_interval", type=int, default=50)
     parser.add_argument("--min_cluster_points", type=int, default=100)
-    parser.add_argument("--stpr_cluster_method", choices=["3dgs", "feature_kmeans"], default="3dgs")
+    parser.add_argument("--stpr_cluster_method", choices=["coarse_kmeans", "3dgs", "feature_kmeans"], default="coarse_kmeans")
+    parser.add_argument("--stpr_appgs_per_stpr", type=int, default=50)
     parser.add_argument("--stpr_dbscan_eps", type=float, default=0.0)
     parser.add_argument("--stpr_dbscan_min_samples", type=int, default=5)
     parser.add_argument("--stpr_feature_source", choices=["precomputed", "image_rgb"], default="precomputed")
@@ -953,6 +1056,12 @@ if __name__ == "__main__":
     parser.add_argument("--stpr_feature_max_cameras", type=int, default=32)
     parser.add_argument("--stpr_feature_min_views", type=int, default=1)
     parser.add_argument("--stpr_feature_mask_threshold", type=float, default=0.5)
+    parser.add_argument("--stpr_semantic_dim", type=int, default=0)
+    parser.add_argument("--lambda_dino_sem", type=float, default=0.0)
+    parser.add_argument("--lambda_stpr_sem_proto", type=float, default=0.0)
+    parser.add_argument("--stpr_leaf_proto", type=str, default="")
+    parser.add_argument("--stpr_branch_proto", type=str, default="")
+    parser.add_argument("--stpr_semantic_temperature", type=float, default=0.07)
     parser.add_argument("--object_mask_threshold", type=float, default=0.5)
     parser.add_argument("--object_mask_min_views", type=int, default=1)
     parser.add_argument("--stpr_min_clusters", type=int, default=10)
@@ -988,6 +1097,8 @@ if __name__ == "__main__":
 
     
     args = parser.parse_args(sys.argv[1:])
+    if (args.lambda_dino_sem > 0 or args.lambda_stpr_sem_proto > 0) and args.stpr_semantic_dim <= 0:
+        raise ValueError("--stpr_semantic_dim must be > 0 when DINO semantic losses are enabled.")
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)

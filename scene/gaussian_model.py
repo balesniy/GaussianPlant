@@ -48,7 +48,7 @@ class GaussianModel:
             actual_covariance = L @ L.transpose(1, 2)
             symm = strip_symmetric(actual_covariance)
             return symm
-        
+
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
 
@@ -92,7 +92,8 @@ class GaussianModel:
         self.app_label = None
         self._pst_logit = None
         self._semantic_logit = None
-        
+        self._semantic_feature = torch.empty(0)
+
     def capture(self):
         return (
             self.active_sh_degree,
@@ -116,6 +117,7 @@ class GaussianModel:
                 "exposure_optimizer": self.exposure_optimizer.state_dict() if hasattr(self, "exposure_optimizer") else None,
                 "pst_logit": self._pst_logit,
                 "semantic_logit": self._semantic_logit,
+                "semantic_feature": self._semantic_feature,
             },
         )
     
@@ -145,6 +147,7 @@ class GaussianModel:
             "semantic_logit",
             nn.Parameter(torch.zeros((self._xyz.shape[0], 1), dtype=torch.float, device=self.device).requires_grad_(True))
         )
+        self._semantic_feature = metadata.get("semantic_feature", torch.empty(0, device=self.device))
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -299,6 +302,8 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
+        if self._semantic_feature.numel():
+            l.append({'params': [self._semantic_feature], 'lr': training_args.feature_lr, "name": "semantic_feature"})
 
         if self.optimizer_type == "default":
             self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -391,6 +396,8 @@ class GaussianModel:
         clone._scaling = nn.Parameter(self._scaling.detach()[keep_mask].clone().requires_grad_(True))
         clone._rotation = nn.Parameter(self._rotation.detach()[keep_mask].clone().requires_grad_(True))
         clone._mask = self._mask.detach()[keep_mask].clone()
+        if self._semantic_feature.numel():
+            clone._semantic_feature = nn.Parameter(self._semantic_feature.detach()[keep_mask].clone().requires_grad_(True))
         clone.max_radii2D = torch.zeros((clone.get_xyz.shape[0]), device=self.device)
         clone.xyz_gradient_accum = torch.zeros((clone.get_xyz.shape[0], 1), device=self.device)
         clone.denom = torch.zeros((clone.get_xyz.shape[0], 1), device=self.device)
@@ -530,6 +537,8 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         if "semantic" in optimizable_tensors:
             self._semantic_logit = optimizable_tensors["semantic"]
+        if "semantic_feature" in optimizable_tensors:
+            self._semantic_feature = optimizable_tensors["semantic_feature"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
@@ -572,7 +581,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_label=None, flag=None, new_pst_logit=None, new_semantic=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_label=None, flag=None, new_pst_logit=None, new_semantic=None, new_semantic_feature=None):
         self._ensure_mask_shape()
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
@@ -583,6 +592,10 @@ class GaussianModel:
         "rotation" : new_rotation}
         if self._pst_logit is not None and new_pst_logit is not None:
             d["pst"] = new_pst_logit
+        if self._semantic_feature.numel():
+            if new_semantic_feature is None:
+                new_semantic_feature = torch.zeros((new_xyz.shape[0], self._semantic_feature.shape[1]), dtype=self._semantic_feature.dtype, device=self.device)
+            d["semantic_feature"] = new_semantic_feature
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -594,6 +607,8 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         if "pst" in optimizable_tensors:
             self._pst_logit = optimizable_tensors["pst"]
+        if "semantic_feature" in optimizable_tensors:
+            self._semantic_feature = optimizable_tensors["semantic_feature"]
 
         new_mask = torch.ones((new_xyz.shape[0],), dtype=self._mask.dtype, device=self._mask.device)
         self._mask = torch.cat((self._mask, new_mask), dim=0)
@@ -633,6 +648,7 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_semantic = self._semantic_logit[selected_pts_mask].repeat(N,1) if self._semantic_logit is not None else torch.zeros_like(new_opacity)
+        new_semantic_feature = self._semantic_feature[selected_pts_mask].repeat(N, 1) if self._semantic_feature.numel() else None
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
         new_label = None
         new_pst_logit = None
@@ -647,7 +663,7 @@ class GaussianModel:
         elif flag is not None:
             raise ValueError(f"Unknown densification flag: {flag}")
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii,new_label,flag,new_pst_logit,new_semantic)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii,new_label,flag,new_pst_logit,new_semantic,new_semantic_feature)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device=self.device, dtype=bool)))
         self.prune_points(prune_filter)
@@ -663,6 +679,7 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
         new_semantic = self._semantic_logit[selected_pts_mask] if self._semantic_logit is not None else torch.zeros_like(new_opacities)
+        new_semantic_feature = self._semantic_feature[selected_pts_mask] if self._semantic_feature.numel() else None
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
@@ -678,7 +695,7 @@ class GaussianModel:
         elif flag is not None:
             raise ValueError(f"Unknown densification flag: {flag}")
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii,new_label,flag,new_pst_logit,new_semantic)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii,new_label,flag,new_pst_logit,new_semantic,new_semantic_feature)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, flag='stpr', only_prune=False, size_threshold_small=None):
         grads = self.xyz_gradient_accum / self.denom
@@ -710,8 +727,9 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    def build_stprs_from_gs(self, num_clusters=100,method: Literal['kmeans', 'random', '3dgs', 'feature_kmeans'] = '3dgs', min_cluster_points=100,
-                            point_features=None, stpr_feature_weight=1.0, stpr_xyz_weight=0.25,
+    def build_stprs_from_gs(self, num_clusters=100,method: Literal['coarse_kmeans', 'kmeans', 'random', '3dgs', 'feature_kmeans'] = 'coarse_kmeans', min_cluster_points=100,
+                            point_features=None, stpr_feature_weight=1.0, stpr_xyz_weight=0.25, stpr_appgs_per_stpr=50,
+                            stpr_semantic_dim=0,
                             scene_extent=None, stpr_min_scale_ratio=1e-5, stpr_max_scale_ratio=0.5,
                             debug_dir=None, plant_prior="mixed", no_leaf_mode=False,
                             stpr_dbscan_eps=0.005, stpr_dbscan_min_samples=5,
@@ -755,27 +773,74 @@ class GaussianModel:
         branch_index = []
         leaf_index = []
         surf_rotations = []
-        if method == 'kmeans':
-            # Flatten covariance matrices for clustering
-            covariances_flat = covariance.reshape(covariance.shape[0], -1)
-            feature_vectors = np.hstack((xyz, covariances_flat))  # Include covariance in clustering
-            # Use faiss for clustering
-            kmeans = faiss.Kmeans(d=feature_vectors.shape[1], k=num_clusters, niter=20, nredo=5,gpu=True)
-            kmeans.train(feature_vectors.astype(np.float32))
-            cluster_labels = kmeans.index.search(feature_vectors.astype(np.float32), 1)[1].flatten()
+        if method in ('coarse_kmeans', 'kmeans'):
+            k = max(1, min(num_clusters, xyz.shape[0] // max(min_cluster_points, 1)))
+            xyz_center = xyz.mean(axis=0, keepdims=True)
+            xyz_scale = scene_extent if scene_extent is not None and scene_extent > 0 else np.linalg.norm(xyz.max(axis=0) - xyz.min(axis=0))
+            feature_vectors = ((xyz - xyz_center) / max(float(xyz_scale), 1e-6)).astype(np.float32)
+            print(f"[DEBUG][coarse-kmeans] points={xyz.shape[0]} k={k} target_points_per_stpr~{max(xyz.shape[0] // max(k, 1), 1)}")
+            kmeans = faiss.Kmeans(d=feature_vectors.shape[1], k=k, niter=25, nredo=3, gpu=True)
+            kmeans.train(feature_vectors)
+            labels = kmeans.index.search(feature_vectors, 1)[1].flatten()
+            point_colors = np.full((xyz.shape[0], 3), 0.7, dtype=np.float32)
+            used_points = 0
+            skipped_tiny = 0
+            index = 0
 
-            for cluster_id in range(num_clusters):
-                cluster_points = xyz[cluster_labels == cluster_id]
-                cluster_scales = scaling[cluster_labels == cluster_id]
-                cluster_rotations = rotation[cluster_labels == cluster_id]
-
-                if len(cluster_points) > 1:
-                    # Compute PCA for scaling & rotation estimation
-                    mean,stpr_rot, stpr_scale = estimate_gs_para_from_cluster(cluster_points)
+            for label in np.unique(labels):
+                cluster_mask = labels == label
+                cluster_points = xyz[cluster_mask]
+                if len(cluster_points) < 3:
+                    skipped_tiny += len(cluster_points)
+                    continue
+                used_points += len(cluster_points)
+                mean, stpr_rot, stpr_scale, rot_cylinder, rot_disk = estimate_gs_para_from_cluster(cluster_points, test_flag=False)
+                feature_dc_stpr = feature_dc[cluster_mask].mean(axis=0)
+                feature_rest_stpr = feature_rest[cluster_mask].mean(axis=0)
+                is_branch = no_leaf_mode or not is_leaf(cluster_points)
 
                 stpr_positions.append(mean)
-                stpr_scales.append(stpr_scale)
                 stpr_rotations.append(stpr_rot)
+                stpr_features_dc.append(feature_dc_stpr)
+                stpr_features_rest.append(feature_rest_stpr)
+                if is_branch:
+                    stpr_scales.append(stpr_scale)
+                    branch_positions.append(mean)
+                    branch_scales.append(stpr_scale)
+                    branch_rotations.append(rot_cylinder)
+                    surf_rotations.append(rot_cylinder)
+                    branch_quat.append(stpr_rot)
+                    branch_points_all.append(cluster_points)
+                    branch_feature_dc.append(feature_dc_stpr)
+                    branch_feature_rest.append(feature_rest_stpr)
+                    stpr_label.append('branch')
+                    branch_index.append(index)
+                    point_colors[cluster_mask] = [1.0, 0.0, 0.0]
+                else:
+                    stpr_scale[2] = 1e-6
+                    stpr_scales.append(stpr_scale)
+                    leaf_positions.append(mean)
+                    leaf_scales.append(stpr_scale)
+                    leaf_quat.append(stpr_rot)
+                    leaf_rotations.append(rot_disk)
+                    leaf_feature_dc.append(feature_dc_stpr)
+                    leaf_feature_rest.append(feature_rest_stpr)
+                    surf_rotations.append(rot_disk)
+                    stpr_label.append('leaf')
+                    leaf_index.append(index)
+                    point_colors[cluster_mask] = [0.0, 1.0, 0.0]
+                index += 1
+
+            if debug_dir is not None:
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(xyz)
+                pcd.colors = o3d.utility.Vector3dVector(point_colors)
+                o3d.io.write_point_cloud(os.path.join(debug_dir, "coarse_kmeans_leaf_branch.ply"), pcd)
+            print(
+                f"[DEBUG][coarse-kmeans] initialized_stprs={len(stpr_positions)} "
+                f"used_points={used_points}/{xyz.shape[0]} ({used_points / max(xyz.shape[0], 1):.1%}) "
+                f"skipped_tiny={skipped_tiny} leaf={len(leaf_index)} branch={len(branch_index)}"
+            )
         elif method == 'random':
             pass
         elif method in ('3dgs', 'feature_kmeans'):
@@ -814,11 +879,11 @@ class GaussianModel:
                 rng = np.random.default_rng(0)
                 colors = rng.random((len(unique_labels), 3), dtype=np.float32)
                 used_points = 0
-                small_cluster_points = 0
+                skipped_tiny = 0
                 for color_idx, label in enumerate(sorted(unique_labels)):
                     cluster_points = xyz[labels == label]
-                    if len(cluster_points) < min_cluster_points:
-                        small_cluster_points += len(cluster_points)
+                    if len(cluster_points) < 3:
+                        skipped_tiny += len(cluster_points)
                         continue
                     used_points += len(cluster_points)
                     if no_leaf_mode:
@@ -838,7 +903,7 @@ class GaussianModel:
                     o3d.io.write_point_cloud(os.path.join(debug_dir, "feature_kmeans_leaf_branch.ply"), pcd)
                 print(
                     f"[DEBUG][feature-kmeans] clusters={len(unique_labels)} valid_clusters={len(label_leaf) + len(label_branch)} "
-                    f"small_cluster_points={small_cluster_points}/{xyz.shape[0]} "
+                    f"skipped_tiny={skipped_tiny} "
                     f"used_points={used_points}/{xyz.shape[0]} ({used_points / max(xyz.shape[0], 1):.1%}) "
                     f"leaf={len(label_leaf)} branch={len(label_branch)}"
                 )
@@ -947,34 +1012,67 @@ class GaussianModel:
                     leaf_index.append(index)
                 index += 1
 
-            if branch_points_all:
-                mesh_cylinder = branch_to_cylinder(branch_points=np.vstack(branch_points_all), branch_positions=branch_positions,
-                                   branch_scales=branch_scales, branch_rotations=branch_rotations) # list of open3d mesh
-            else:
-                print("Warning: no branch primitives detected; continuing with leaf-only StPr initialization.")
-                mesh_cylinder = None
-
-            if leaf_positions and not no_leaf_mode:
-                leaf_disk = leaf_to_disk(leaf_positions=leaf_positions, leaf_scales=leaf_scales, leaf_rotations=leaf_rotations,save_flag=False) # list of open3d mesh
-            else:
-                print("Warning: no leaf primitives detected; continuing with branch-only StPr initialization.")
-                leaf_disk = None
-            
-            self.appgs = self.build_appgs_from_stprs(mesh_cylinder,branch_scales,branch_quat, branch_feature_dc,branch_feature_rest,
-                                                     leaf_disk,leaf_scales, leaf_quat, leaf_feature_dc, leaf_feature_rest,
-                                                     branch_label=branch_index, leaf_label=leaf_index,
-                                                     samples_per_branch=10, samples_per_leaf=10,
-                                                     )
-            self.leaf_disks = leaf_disk
-            self.branch_cylinders = mesh_cylinder
-            self.branch_label = branch_index
-            self.leaf_label = leaf_index
-            
-            
-
-        
         else:
-            raise ValueError("Unknown clustering method. Use 'pca' or 'random'.")
+            raise ValueError("Unknown clustering method. Use 'coarse_kmeans', 'feature_kmeans', or '3dgs'.")
+
+        if not stpr_positions:
+            fallback_label = "branch" if no_leaf_mode else "leaf"
+            print(f"Warning: no StPr clusters detected; falling back to one {fallback_label}-like primitive from all Gaussians.")
+            mean, stpr_rot, stpr_scale, rot_cylinder, rot_disk = estimate_gs_para_from_cluster(xyz, test_flag=False)
+            feature_dc_stpr = feature_dc.mean(axis=0)
+            feature_rest_stpr = feature_rest.mean(axis=0)
+            stpr_positions.append(mean)
+            stpr_rotations.append(stpr_rot)
+            stpr_features_dc.append(feature_dc_stpr)
+            stpr_features_rest.append(feature_rest_stpr)
+            if no_leaf_mode:
+                stpr_scales.append(stpr_scale)
+                branch_positions.append(mean)
+                branch_scales.append(stpr_scale)
+                branch_rotations.append(rot_cylinder)
+                surf_rotations.append(rot_cylinder)
+                branch_quat.append(stpr_rot)
+                branch_points_all.append(xyz)
+                branch_feature_dc.append(feature_dc_stpr)
+                branch_feature_rest.append(feature_rest_stpr)
+                stpr_label.append('branch')
+                branch_index.append(0)
+            else:
+                stpr_scale[2] = 1e-6
+                stpr_scales.append(stpr_scale)
+                leaf_positions.append(mean)
+                leaf_scales.append(stpr_scale)
+                leaf_quat.append(stpr_rot)
+                leaf_rotations.append(rot_disk)
+                leaf_feature_dc.append(feature_dc_stpr)
+                leaf_feature_rest.append(feature_rest_stpr)
+                surf_rotations.append(rot_disk)
+                stpr_label.append('leaf')
+                leaf_index.append(0)
+
+        if branch_points_all:
+            mesh_cylinder = branch_to_cylinder(branch_points=np.vstack(branch_points_all), branch_positions=branch_positions,
+                               branch_scales=branch_scales, branch_rotations=branch_rotations) # list of open3d mesh
+        else:
+            print("Warning: no branch primitives detected; continuing with leaf-only StPr initialization.")
+            mesh_cylinder = None
+
+        if leaf_positions and not no_leaf_mode:
+            leaf_disk = leaf_to_disk(leaf_positions=leaf_positions, leaf_scales=leaf_scales, leaf_rotations=leaf_rotations,save_flag=False) # list of open3d mesh
+        else:
+            print("Warning: no leaf primitives detected; continuing with branch-only StPr initialization.")
+            leaf_disk = None
+
+        self.appgs = self.build_appgs_from_stprs(mesh_cylinder,branch_scales,branch_quat, branch_feature_dc,branch_feature_rest,
+                                                 leaf_disk,leaf_scales, leaf_quat, leaf_feature_dc, leaf_feature_rest,
+                                                 branch_label=branch_index, leaf_label=leaf_index,
+                                                 samples_per_branch=stpr_appgs_per_stpr, samples_per_leaf=stpr_appgs_per_stpr,
+                                                 semantic_dim=stpr_semantic_dim,
+                                                 )
+        self.leaf_disks = leaf_disk
+        self.branch_cylinders = mesh_cylinder
+        self.branch_label = branch_index
+        self.leaf_label = leaf_index
 
         # Convert lists to tensors
         # stpr_rotations = np.roll(np.array(stpr_rotations), 1, axis=1)
@@ -1028,6 +1126,8 @@ class GaussianModel:
         self.structure_gs._features_rest = nn.Parameter(stpr_features_rest.requires_grad_(True))
         self.structure_gs._opacity = nn.Parameter(stpr_opacities.requires_grad_(True))
         self.structure_gs._semantic_logit = nn.Parameter(torch.ones((stpr_positions.shape[0], 1), dtype=torch.float, device=self.device).requires_grad_(True))
+        if stpr_semantic_dim > 0:
+            self.structure_gs._semantic_feature = nn.Parameter(torch.zeros((stpr_positions.shape[0], stpr_semantic_dim), dtype=torch.float, device=self.device).requires_grad_(True))
         self.structure_gs.max_radii2D = torch.zeros((stpr_positions.shape[0]), device=self.device)
         self.structure_gs._mask = torch.ones((stpr_positions.shape[0],), dtype=torch.float, device=self.device)
         self.structure_gs.exposure_mapping = self.exposure_mapping
@@ -1055,7 +1155,7 @@ class GaussianModel:
     def build_appgs_from_stprs(self, mesh_cylinder,branch_scales,branch_rotations, branch_feature_dc, branch_feature_rest,
                                leaf_disk,leaf_scales, leaf_rotations,leaf_feature_dc, leaf_feature_rest,
                                branch_label, leaf_label,
-                               samples_per_branch=10, samples_per_leaf=10):
+                               samples_per_branch=10, samples_per_leaf=10, semantic_dim=0):
         """
         Build Appearance Gaussians (AppGs) from the structural primitives (StPrs).
         """
@@ -1121,6 +1221,8 @@ class GaussianModel:
         self.appgs._features_rest = nn.Parameter(appgs_features_rest.requires_grad_(True))
         self.appgs._opacity = nn.Parameter(new_opacities.requires_grad_(True))
         self.appgs._semantic_logit = nn.Parameter(torch.ones((num_total_samples, 1), dtype=torch.float, device=self.device).requires_grad_(True))
+        if semantic_dim > 0:
+            self.appgs._semantic_feature = nn.Parameter(torch.zeros((num_total_samples, semantic_dim), dtype=torch.float, device=self.device).requires_grad_(True))
         self.appgs.max_radii2D = torch.zeros((num_total_samples), device=self.device)
         self.appgs._mask = torch.ones((num_total_samples), dtype=torch.float, device=self.device)
         self.appgs.exposure_mapping = self.exposure_mapping
