@@ -333,6 +333,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     debug_dir=scene.model_path,
                     plant_prior="branch_only" if args.no_leaf_mode else args.plant_prior,
                     no_leaf_mode=args.no_leaf_mode,
+                    geometry_refine_labels=args.geometry_refine_labels,
+                    geometry_knn=args.geometry_knn,
+                    geometry_cost_threshold=args.geometry_cost_threshold,
+                    geometry_max_dist_factor=args.geometry_max_dist_factor,
                 )
                 gaussians_init.structure_gs = stprs
                 gaussians_init.appgs = appgs
@@ -843,6 +847,10 @@ if __name__ == "__main__":
     parser.add_argument("--mask_dilate_radius", type=int, default=3)
     parser.add_argument("--bg_alpha_ramp_start", type=int, default=1000)
     parser.add_argument("--bg_alpha_ramp_end", type=int, default=5000)
+    parser.add_argument("--geometry_refine_labels", action="store_true", default=False)
+    parser.add_argument("--geometry_knn", type=int, default=12)
+    parser.add_argument("--geometry_cost_threshold", type=float, default=0.55)
+    parser.add_argument("--geometry_max_dist_factor", type=float, default=6.0)
     parser.add_argument('--gpu', type=int, default=0, help='Index of GPU device to use.')
     parser.add_argument("--reg_mask", action="store_true", default=False)
     parser.add_argument("--reg_align", action="store_true", default=False)

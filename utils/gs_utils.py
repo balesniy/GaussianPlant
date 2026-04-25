@@ -132,7 +132,126 @@ def don_func(gaussian,radius1, radius2,threshold, knn1,knn2,method='radius',vis_
         o3d.io.write_point_cloud("output/ficus/max_5000/point_cloud/iteration_7000/branch.ply", pcd_branch)
         o3d.io.write_point_cloud("output/ficus/max_5000/point_cloud/iteration_7000/leaf.ply", pcd_leaf)
 
-def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_cluster_points=100, save_prefix=None, force_branch=False): 
+def estimate_local_pca_geometry(points, knn=16):
+    n_points = points.shape[0]
+    axes = np.zeros((n_points, 3), dtype=np.float32)
+    anisotropy = np.ones((n_points,), dtype=np.float32)
+    radius = np.ones((n_points,), dtype=np.float32) * 1e-3
+    if n_points < 3:
+        axes[:, 0] = 1.0
+        return axes, anisotropy, radius
+
+    tree = cKDTree(points)
+    query_k = min(knn, n_points)
+    _, neighbors = tree.query(points, k=query_k)
+    if query_k == 1:
+        neighbors = neighbors[:, None]
+
+    for i in range(n_points):
+        pts = points[neighbors[i]]
+        pts = pts - pts.mean(axis=0, keepdims=True)
+        cov = pts.T @ pts / max(pts.shape[0] - 1, 1)
+        evals, evecs = np.linalg.eigh(cov)
+        order = np.argsort(evals)[::-1]
+        evals = np.maximum(evals[order], 1e-10)
+        evecs = evecs[:, order]
+        axes[i] = evecs[:, 0]
+        anisotropy[i] = evals[0] / (evals[1] + 1e-8)
+        radius[i] = np.sqrt(evals[1] + 1e-8)
+    return axes, anisotropy, radius
+
+def geometry_edge_cost(xi, xj, ui, uj, ri, rj, ai, aj, scene_extent):
+    v = xj - xi
+    d = np.linalg.norm(v)
+    if d < 1e-8:
+        return 0.0
+    t = v / d
+    dist_cost = d / max(scene_extent, 1e-8)
+    axis_cost = 1.0 - abs(float(np.dot(ui, uj)))
+    tangent_cost = 1.0 - max(abs(float(np.dot(t, ui))), abs(float(np.dot(t, uj))))
+    radius_cost = abs(np.log((ri + 1e-6) / (rj + 1e-6)))
+    aniso_cost = abs(np.log((ai + 1e-6) / (aj + 1e-6)))
+    return dist_cost + 0.5 * axis_cost + 0.7 * tangent_cost + 0.2 * radius_cost + 0.2 * aniso_cost
+
+def refine_labels_with_geometry_graph(
+        points,
+        labels,
+        knn=12,
+        cost_threshold=0.55,
+        max_dist_factor=6.0,
+        min_component_points=20,
+        scene_extent=None,
+):
+    if points.shape[0] == 0:
+        return labels
+    if scene_extent is None:
+        scene_extent = float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
+    axes, anisotropy, radius = estimate_local_pca_geometry(points, knn=max(knn + 1, 4))
+    refined = np.full_like(labels, -1)
+    next_label = 0
+
+    for label in sorted(set(labels)):
+        if label == -1:
+            continue
+        cluster_idx = np.where(labels == label)[0]
+        if cluster_idx.shape[0] < min_component_points:
+            continue
+
+        local_points = points[cluster_idx]
+        tree = cKDTree(local_points)
+        query_k = min(knn + 1, cluster_idx.shape[0])
+        _, neigh = tree.query(local_points, k=query_k)
+        if query_k == 1:
+            neigh = neigh[:, None]
+
+        parent = np.arange(cluster_idx.shape[0], dtype=np.int32)
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for local_i in range(cluster_idx.shape[0]):
+            i = cluster_idx[local_i]
+            for local_j in np.atleast_1d(neigh[local_i])[1:]:
+                j = cluster_idx[int(local_j)]
+                d = np.linalg.norm(points[j] - points[i])
+                max_dist = max_dist_factor * max(radius[i], radius[j], scene_extent * 0.002)
+                if d > max_dist:
+                    continue
+                cost = geometry_edge_cost(
+                    points[i], points[j],
+                    axes[i], axes[j],
+                    radius[i], radius[j],
+                    anisotropy[i], anisotropy[j],
+                    scene_extent,
+                )
+                if cost < cost_threshold:
+                    union(local_i, int(local_j))
+
+        components = {}
+        for local_i, global_i in enumerate(cluster_idx):
+            root = find(local_i)
+            components.setdefault(root, []).append(global_i)
+
+        for component in components.values():
+            if len(component) < min_component_points:
+                continue
+            refined[np.array(component, dtype=np.int64)] = next_label
+            next_label += 1
+
+    print(f"[DEBUG][geometry-refine] labels before={len(set(labels)) - (1 if -1 in labels else 0)} after={next_label}")
+    return refined
+
+def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_cluster_points=100, save_prefix=None, force_branch=False,
+                        geometry_refine=False, geometry_knn=12, geometry_cost_threshold=0.55, geometry_max_dist_factor=6.0,
+                        scene_extent=None): 
     from sklearn.cluster import DBSCAN
 
     # Dummy logic: let's just run DBSCAN to group roughly linear segments (can be seen as 'branches')
@@ -140,6 +259,16 @@ def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_clu
 
     clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(points) # 0.005,5
     labels = clustering.labels_
+    if geometry_refine:
+        labels = refine_labels_with_geometry_graph(
+            points,
+            labels,
+            knn=geometry_knn,
+            cost_threshold=geometry_cost_threshold,
+            max_dist_factor=geometry_max_dist_factor,
+            min_component_points=min_cluster_points,
+            scene_extent=scene_extent,
+        )
     
     # Assign color by label
     colors = np.random.rand(len(set(labels)), 3)

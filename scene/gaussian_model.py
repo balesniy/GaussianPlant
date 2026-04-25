@@ -688,7 +688,9 @@ class GaussianModel:
 
     def build_stprs_from_gs(self, num_clusters=100,method: Literal['kmeans', 'random', '3dgs'] = '3dgs', min_cluster_points=100,
                             scene_extent=None, stpr_min_scale_ratio=1e-5, stpr_max_scale_ratio=0.5,
-                            debug_dir=None, plant_prior="mixed", no_leaf_mode=False):
+                            debug_dir=None, plant_prior="mixed", no_leaf_mode=False,
+                            geometry_refine_labels=False, geometry_knn=12,
+                            geometry_cost_threshold=0.55, geometry_max_dist_factor=6.0):
         """
         structural primitives (StPrs) from optimized Gaussians by clustering them.
         param num_clusters: Number of clusters for grouping Gaussians into structural primitives.
@@ -759,6 +761,11 @@ class GaussianModel:
                 min_cluster_points=min_cluster_points,
                 save_prefix=os.path.join(debug_dir, "fit_cylinder_ransac") if debug_dir else None,
                 force_branch=no_leaf_mode,
+                geometry_refine=geometry_refine_labels,
+                geometry_knn=geometry_knn,
+                geometry_cost_threshold=geometry_cost_threshold,
+                geometry_max_dist_factor=geometry_max_dist_factor,
+                scene_extent=scene_extent,
             )
             print(f"[DEBUG][ransac] num ransac labels={len(np.unique(labels))} num leaf labels={len(label_leaf)} num branch labels={len(label_branch)}")
             index = 0
