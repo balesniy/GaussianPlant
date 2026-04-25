@@ -333,6 +333,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     debug_dir=scene.model_path,
                     plant_prior="branch_only" if args.no_leaf_mode else args.plant_prior,
                     no_leaf_mode=args.no_leaf_mode,
+                    stpr_dbscan_eps=args.stpr_dbscan_eps,
+                    stpr_dbscan_min_samples=args.stpr_dbscan_min_samples,
                     geometry_refine_labels=args.geometry_refine_labels,
                     geometry_knn=args.geometry_knn,
                     geometry_cost_threshold=args.geometry_cost_threshold,
@@ -835,6 +837,8 @@ if __name__ == "__main__":
     parser.add_argument("--tb_image_interval", type=int, default=1000)
     parser.add_argument("--neighbor_update_interval", type=int, default=50)
     parser.add_argument("--min_cluster_points", type=int, default=100)
+    parser.add_argument("--stpr_dbscan_eps", type=float, default=0.0)
+    parser.add_argument("--stpr_dbscan_min_samples", type=int, default=5)
     parser.add_argument("--object_mask_threshold", type=float, default=0.5)
     parser.add_argument("--object_mask_min_views", type=int, default=1)
     parser.add_argument("--stpr_min_clusters", type=int, default=10)

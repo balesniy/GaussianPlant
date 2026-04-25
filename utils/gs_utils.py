@@ -323,6 +323,16 @@ def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_clu
     # Dummy logic: let's just run DBSCAN to group roughly linear segments (can be seen as 'branches')
     # (0.03,5) for plant4 | (0.005,5) for ficus
 
+    if eps is None or eps <= 0:
+        sample_count = min(points.shape[0], 50000)
+        sample_idx = np.linspace(0, points.shape[0] - 1, sample_count, dtype=np.int64)
+        nn_k = max(2, min_samples)
+        dists, _ = cKDTree(points[sample_idx]).query(points[sample_idx], k=nn_k)
+        eps = float(np.percentile(dists[:, -1], 90) * 2.0)
+        if scene_extent is not None:
+            eps = float(np.clip(eps, 0.001 * scene_extent, 0.02 * scene_extent))
+        print(f"[DEBUG][dbscan] auto eps={eps:.6g} from {sample_count} sampled points")
+
     clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(points) # 0.005,5
     labels = clustering.labels_
     if geometry_refine:
@@ -360,6 +370,9 @@ def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_clu
     unique_labels = set(labels)
     label_leaf = []
     label_branch = []
+    valid_points = 0
+    small_cluster_points = 0
+    noise_points = int(np.sum(labels == -1))
     for label in unique_labels:
         if label == -1:
             # Noise
@@ -369,9 +382,11 @@ def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_clu
         cluster_points = points[labels == label]
 
         if len(cluster_points) < min_cluster_points:
+            small_cluster_points += len(cluster_points)
             point_colors[labels == label] = noise_color
             continue
 
+        valid_points += len(cluster_points)
         if force_branch:
             point_colors[labels == label] = branch_color
             label_branch.append(label)
@@ -381,6 +396,16 @@ def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_clu
         else:
             point_colors[labels == label] = branch_color
             label_branch.append(label)
+    num_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
+    valid_clusters = len(label_leaf) + len(label_branch)
+    total_points = max(points.shape[0], 1)
+    print(
+        f"[DEBUG][dbscan] eps={eps:.6g} min_samples={min_samples} min_cluster_points={min_cluster_points} "
+        f"clusters={num_clusters} valid_clusters={valid_clusters} "
+        f"noise_points={noise_points}/{points.shape[0]} ({noise_points / total_points:.1%}) "
+        f"small_cluster_points={small_cluster_points}/{points.shape[0]} ({small_cluster_points / total_points:.1%}) "
+        f"used_points={valid_points}/{points.shape[0]} ({valid_points / total_points:.1%})"
+    )
     if save_ply:
         pcd.colors = o3d.utility.Vector3dVector(point_colors)
         path = f"{save_prefix}_leaf_branch.ply" if save_prefix else "dbscan_segment_leaf_branch_ficus.ply"

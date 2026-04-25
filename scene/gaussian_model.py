@@ -712,6 +712,7 @@ class GaussianModel:
     def build_stprs_from_gs(self, num_clusters=100,method: Literal['kmeans', 'random', '3dgs'] = '3dgs', min_cluster_points=100,
                             scene_extent=None, stpr_min_scale_ratio=1e-5, stpr_max_scale_ratio=0.5,
                             debug_dir=None, plant_prior="mixed", no_leaf_mode=False,
+                            stpr_dbscan_eps=0.005, stpr_dbscan_min_samples=5,
                             geometry_refine_labels=False, geometry_knn=12,
                             geometry_cost_threshold=0.55, geometry_max_dist_factor=6.0,
                             geometry_axis_threshold=0.35, geometry_tangent_threshold=0.55,
@@ -782,6 +783,8 @@ class GaussianModel:
             """
             label_leaf, label_branch, labels = fit_cylinder_ransac(
                 xyz,
+                eps=stpr_dbscan_eps,
+                min_samples=stpr_dbscan_min_samples,
                 save_ply=debug_dir is not None,
                 min_cluster_points=min_cluster_points,
                 save_prefix=os.path.join(debug_dir, "fit_cylinder_ransac") if debug_dir else None,
