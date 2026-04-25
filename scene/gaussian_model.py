@@ -690,7 +690,9 @@ class GaussianModel:
                             scene_extent=None, stpr_min_scale_ratio=1e-5, stpr_max_scale_ratio=0.5,
                             debug_dir=None, plant_prior="mixed", no_leaf_mode=False,
                             geometry_refine_labels=False, geometry_knn=12,
-                            geometry_cost_threshold=0.55, geometry_max_dist_factor=6.0):
+                            geometry_cost_threshold=0.55, geometry_max_dist_factor=6.0,
+                            geometry_axis_threshold=0.35, geometry_tangent_threshold=0.55,
+                            geometry_radius_threshold=0.8, geometry_radius_graph_r=None):
         """
         structural primitives (StPrs) from optimized Gaussians by clustering them.
         param num_clusters: Number of clusters for grouping Gaussians into structural primitives.
@@ -765,6 +767,10 @@ class GaussianModel:
                 geometry_knn=geometry_knn,
                 geometry_cost_threshold=geometry_cost_threshold,
                 geometry_max_dist_factor=geometry_max_dist_factor,
+                geometry_axis_threshold=geometry_axis_threshold,
+                geometry_tangent_threshold=geometry_tangent_threshold,
+                geometry_radius_threshold=geometry_radius_threshold,
+                geometry_radius_graph_r=geometry_radius_graph_r,
                 scene_extent=scene_extent,
             )
             print(f"[DEBUG][ransac] num ransac labels={len(np.unique(labels))} num leaf labels={len(label_leaf)} num branch labels={len(label_branch)}")

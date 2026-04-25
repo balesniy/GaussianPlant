@@ -160,25 +160,67 @@ def estimate_local_pca_geometry(points, knn=16):
         radius[i] = np.sqrt(evals[1] + 1e-8)
     return axes, anisotropy, radius
 
-def geometry_edge_cost(xi, xj, ui, uj, ri, rj, ai, aj, scene_extent):
+def geometry_edge_cost_parts(xi, xj, ui, uj, ri, rj, ai, aj, scene_extent):
     v = xj - xi
     d = np.linalg.norm(v)
     if d < 1e-8:
-        return 0.0
+        return {"cost": 0.0, "axis_cost": 0.0, "tangent_cost": 0.0, "radius_cost": 0.0, "aniso_cost": 0.0}
     t = v / d
     dist_cost = d / max(scene_extent, 1e-8)
     axis_cost = 1.0 - abs(float(np.dot(ui, uj)))
     tangent_cost = 1.0 - max(abs(float(np.dot(t, ui))), abs(float(np.dot(t, uj))))
     radius_cost = abs(np.log((ri + 1e-6) / (rj + 1e-6)))
     aniso_cost = abs(np.log((ai + 1e-6) / (aj + 1e-6)))
-    return dist_cost + 0.5 * axis_cost + 0.7 * tangent_cost + 0.2 * radius_cost + 0.2 * aniso_cost
+    cost = dist_cost + 0.5 * axis_cost + 0.7 * tangent_cost + 0.2 * radius_cost + 0.2 * aniso_cost
+    return {
+        "cost": cost,
+        "axis_cost": axis_cost,
+        "tangent_cost": tangent_cost,
+        "radius_cost": radius_cost,
+        "aniso_cost": aniso_cost,
+    }
+
+def cylinder_fit_residual(points):
+    if points.shape[0] < 3:
+        return 0.0
+    pts = points - points.mean(axis=0, keepdims=True)
+    cov = pts.T @ pts / max(points.shape[0] - 1, 1)
+    evals, evecs = np.linalg.eigh(cov)
+    axis = evecs[:, np.argmax(evals)]
+    projected = pts @ axis
+    closest = np.outer(projected, axis)
+    radial = np.linalg.norm(pts - closest, axis=1)
+    radius = np.median(radial)
+    return float(np.mean(np.abs(radial - radius)))
+
+def build_candidate_edges(points, knn=12, radius_graph_r=None):
+    if points.shape[0] <= 1:
+        return []
+    tree = cKDTree(points)
+    edges = set()
+    query_k = min(knn + 1, points.shape[0])
+    _, neigh = tree.query(points, k=query_k)
+    if query_k == 1:
+        neigh = neigh[:, None]
+    for i in range(points.shape[0]):
+        for j in np.atleast_1d(neigh[i])[1:]:
+            a, b = sorted((i, int(j)))
+            if a != b:
+                edges.add((a, b))
+    if radius_graph_r is not None and radius_graph_r > 0:
+        edges.update((int(a), int(b)) for a, b in tree.query_pairs(radius_graph_r))
+    return sorted(edges)
 
 def refine_labels_with_geometry_graph(
         points,
         labels,
         knn=12,
         cost_threshold=0.55,
+        axis_threshold=0.35,
+        tangent_threshold=0.55,
+        radius_threshold=0.8,
         max_dist_factor=6.0,
+        radius_graph_r=None,
         min_component_points=20,
         scene_extent=None,
 ):
@@ -189,20 +231,23 @@ def refine_labels_with_geometry_graph(
     axes, anisotropy, radius = estimate_local_pca_geometry(points, knn=max(knn + 1, 4))
     refined = np.full_like(labels, -1)
     next_label = 0
+    before_residuals = []
+    after_residuals = []
+    component_sizes = []
+    component_anisotropy = []
+    dropped_small = 0
 
     for label in sorted(set(labels)):
         if label == -1:
             continue
         cluster_idx = np.where(labels == label)[0]
         if cluster_idx.shape[0] < min_component_points:
+            dropped_small += 1
             continue
 
         local_points = points[cluster_idx]
-        tree = cKDTree(local_points)
-        query_k = min(knn + 1, cluster_idx.shape[0])
-        _, neigh = tree.query(local_points, k=query_k)
-        if query_k == 1:
-            neigh = neigh[:, None]
+        before_residuals.append(cylinder_fit_residual(local_points))
+        edges = build_candidate_edges(local_points, knn=knn, radius_graph_r=radius_graph_r)
 
         parent = np.arange(cluster_idx.shape[0], dtype=np.int32)
 
@@ -217,23 +262,27 @@ def refine_labels_with_geometry_graph(
             if ra != rb:
                 parent[rb] = ra
 
-        for local_i in range(cluster_idx.shape[0]):
+        for local_i, local_j in edges:
             i = cluster_idx[local_i]
-            for local_j in np.atleast_1d(neigh[local_i])[1:]:
-                j = cluster_idx[int(local_j)]
-                d = np.linalg.norm(points[j] - points[i])
-                max_dist = max_dist_factor * max(radius[i], radius[j], scene_extent * 0.002)
-                if d > max_dist:
-                    continue
-                cost = geometry_edge_cost(
-                    points[i], points[j],
-                    axes[i], axes[j],
-                    radius[i], radius[j],
-                    anisotropy[i], anisotropy[j],
-                    scene_extent,
-                )
-                if cost < cost_threshold:
-                    union(local_i, int(local_j))
+            j = cluster_idx[int(local_j)]
+            d = np.linalg.norm(points[j] - points[i])
+            max_dist = max_dist_factor * max(radius[i], radius[j], scene_extent * 0.002)
+            if d > max_dist:
+                continue
+            parts = geometry_edge_cost_parts(
+                points[i], points[j],
+                axes[i], axes[j],
+                radius[i], radius[j],
+                anisotropy[i], anisotropy[j],
+                scene_extent,
+            )
+            if (
+                parts["cost"] < cost_threshold
+                and parts["axis_cost"] < axis_threshold
+                and parts["tangent_cost"] < tangent_threshold
+                and parts["radius_cost"] < radius_threshold
+            ):
+                union(local_i, int(local_j))
 
         components = {}
         for local_i, global_i in enumerate(cluster_idx):
@@ -242,16 +291,33 @@ def refine_labels_with_geometry_graph(
 
         for component in components.values():
             if len(component) < min_component_points:
+                dropped_small += 1
                 continue
-            refined[np.array(component, dtype=np.int64)] = next_label
+            component_idx = np.array(component, dtype=np.int64)
+            refined[component_idx] = next_label
+            component_sizes.append(len(component))
+            after_residuals.append(cylinder_fit_residual(points[component_idx]))
+            component_anisotropy.append(float(np.mean(anisotropy[component_idx])))
             next_label += 1
 
-    print(f"[DEBUG][geometry-refine] labels before={len(set(labels)) - (1 if -1 in labels else 0)} after={next_label}")
+    sizes = np.array(component_sizes, dtype=np.float32)
+    mean_size = float(sizes.mean()) if sizes.size else 0.0
+    median_size = float(np.median(sizes)) if sizes.size else 0.0
+    before = float(np.mean(before_residuals)) if before_residuals else 0.0
+    after = float(np.mean(after_residuals)) if after_residuals else 0.0
+    mean_aniso = float(np.mean(component_anisotropy)) if component_anisotropy else 0.0
+    print(
+        f"[DEBUG][geometry-refine] DBSCAN clusters={len(set(labels)) - (1 if -1 in labels else 0)} "
+        f"refined components={next_label} mean_size={mean_size:.2f} median_size={median_size:.2f} "
+        f"dropped_small={dropped_small} mean_anisotropy={mean_aniso:.4f} "
+        f"cylinder_residual_before={before:.6g} after={after:.6g}"
+    )
     return refined
 
 def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_cluster_points=100, save_prefix=None, force_branch=False,
                         geometry_refine=False, geometry_knn=12, geometry_cost_threshold=0.55, geometry_max_dist_factor=6.0,
-                        scene_extent=None): 
+                        geometry_axis_threshold=0.35, geometry_tangent_threshold=0.55,
+                        geometry_radius_threshold=0.8, geometry_radius_graph_r=None, scene_extent=None): 
     from sklearn.cluster import DBSCAN
 
     # Dummy logic: let's just run DBSCAN to group roughly linear segments (can be seen as 'branches')
@@ -265,7 +331,11 @@ def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_clu
             labels,
             knn=geometry_knn,
             cost_threshold=geometry_cost_threshold,
+            axis_threshold=geometry_axis_threshold,
+            tangent_threshold=geometry_tangent_threshold,
+            radius_threshold=geometry_radius_threshold,
             max_dist_factor=geometry_max_dist_factor,
+            radius_graph_r=geometry_radius_graph_r,
             min_component_points=min_cluster_points,
             scene_extent=scene_extent,
         )

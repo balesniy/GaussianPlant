@@ -337,6 +337,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     geometry_knn=args.geometry_knn,
                     geometry_cost_threshold=args.geometry_cost_threshold,
                     geometry_max_dist_factor=args.geometry_max_dist_factor,
+                    geometry_axis_threshold=args.geometry_axis_threshold,
+                    geometry_tangent_threshold=args.geometry_tangent_threshold,
+                    geometry_radius_threshold=args.geometry_radius_threshold,
+                    geometry_radius_graph_r=args.geometry_radius_graph_r if args.geometry_radius_graph_r > 0 else None,
                 )
                 gaussians_init.structure_gs = stprs
                 gaussians_init.appgs = appgs
@@ -851,6 +855,10 @@ if __name__ == "__main__":
     parser.add_argument("--geometry_knn", type=int, default=12)
     parser.add_argument("--geometry_cost_threshold", type=float, default=0.55)
     parser.add_argument("--geometry_max_dist_factor", type=float, default=6.0)
+    parser.add_argument("--geometry_axis_threshold", type=float, default=0.35)
+    parser.add_argument("--geometry_tangent_threshold", type=float, default=0.55)
+    parser.add_argument("--geometry_radius_threshold", type=float, default=0.8)
+    parser.add_argument("--geometry_radius_graph_r", type=float, default=0.0)
     parser.add_argument('--gpu', type=int, default=0, help='Index of GPU device to use.')
     parser.add_argument("--reg_mask", action="store_true", default=False)
     parser.add_argument("--reg_align", action="store_true", default=False)
