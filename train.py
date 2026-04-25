@@ -315,8 +315,10 @@ def get_view_feature_map(viewpoint_cam, args):
         ).squeeze(0)
     return fmap
 
-def semantic_feature_render_loss(viewpoint_cam, gaussians, pipe, args):
+def semantic_feature_render_loss(viewpoint_cam, gaussians, pipe, args, iteration):
     if args.lambda_dino_sem <= 0 or gaussians is None or not gaussians._semantic_feature.numel():
+        return torch.tensor(0.0, device=args.device)
+    if args.dino_sem_interval > 1 and iteration % args.dino_sem_interval != 0:
         return torch.tensor(0.0, device=args.device)
     target = get_view_feature_map(viewpoint_cam, args)
     if target is None:
@@ -325,12 +327,16 @@ def semantic_feature_render_loss(viewpoint_cam, gaussians, pipe, args):
     dim = min(target.shape[0], gaussians._semantic_feature.shape[1])
     if dim <= 0:
         return torch.tensor(0.0, device=args.device)
+    render_dim = dim if args.stpr_semantic_render_dim <= 0 else min(dim, args.stpr_semantic_render_dim)
+    offset = ((iteration // max(args.dino_sem_interval, 1)) * render_dim) % dim
+    channel_idx = (torch.arange(render_dim, device=args.device) + offset) % dim
     mask = viewpoint_cam.alpha_mask.to(args.device) if getattr(viewpoint_cam, "has_alpha_mask", False) else None
     denom = mask.sum().clamp(min=1.0) if mask is not None else torch.tensor(float(target.shape[-1] * target.shape[-2]), device=args.device)
-    sem = torch.sigmoid(gaussians._semantic_feature[:, :dim])
+    sem = torch.sigmoid(gaussians._semantic_feature[:, channel_idx])
+    target = target[channel_idx]
     losses = []
-    for start in range(0, dim, 3):
-        end = min(start + 3, dim)
+    for start in range(0, render_dim, 3):
+        end = min(start + 3, render_dim)
         colors = torch.zeros((sem.shape[0], 3), dtype=sem.dtype, device=args.device)
         colors[:, :end - start] = sem[:, start:end]
         rendered = render(viewpoint_cam, gaussians, pipe, torch.zeros((3), dtype=torch.float32, device=args.device), override_color=colors, separate_sh=False)["render"][:end - start]
@@ -718,7 +724,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if opt.lambda_obj_sem > 0:
                 loss += opt.lambda_obj_sem * object_semantic_loss(viewpoint_cam, stprs, pipe, args.device)
             if args.lambda_dino_sem > 0:
-                loss += args.lambda_dino_sem * semantic_feature_render_loss(viewpoint_cam, stprs, pipe, args)
+                loss += args.lambda_dino_sem * semantic_feature_render_loss(viewpoint_cam, stprs, pipe, args, iteration)
             # Depth regularization
             Ll1depth_pure = 0.0
             invDepth = None
@@ -788,7 +794,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if opt.lambda_obj_sem > 0:
                 loss += opt.lambda_obj_sem * object_semantic_loss(viewpoint_cam, appgs, pipe, args.device)
             if args.lambda_dino_sem > 0:
-                loss += args.lambda_dino_sem * semantic_feature_render_loss(viewpoint_cam, appgs, pipe, args)
+                loss += args.lambda_dino_sem * semantic_feature_render_loss(viewpoint_cam, appgs, pipe, args, iteration)
             # Depth regularization for stpr and appgs
             Ll1depth_pure = 0.0
             invDepth_appgs = None
@@ -1065,6 +1071,8 @@ if __name__ == "__main__":
     parser.add_argument("--stpr_feature_min_views", type=int, default=1)
     parser.add_argument("--stpr_feature_mask_threshold", type=float, default=0.5)
     parser.add_argument("--stpr_semantic_dim", type=int, default=0)
+    parser.add_argument("--stpr_semantic_render_dim", type=int, default=12)
+    parser.add_argument("--dino_sem_interval", type=int, default=1)
     parser.add_argument("--lambda_dino_sem", type=float, default=0.0)
     parser.add_argument("--lambda_stpr_sem_proto", type=float, default=0.0)
     parser.add_argument("--stpr_leaf_proto", type=str, default="")
