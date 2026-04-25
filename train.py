@@ -306,6 +306,13 @@ def get_view_feature_map(viewpoint_cam, args):
     if args.stpr_semantic_dim > 0 and fmap.shape[0] != args.stpr_semantic_dim:
         dim = min(fmap.shape[0], args.stpr_semantic_dim)
         fmap = fmap[:dim]
+    if fmap.shape[-2] != viewpoint_cam.image_height or fmap.shape[-1] != viewpoint_cam.image_width:
+        fmap = F.interpolate(
+            fmap.unsqueeze(0),
+            size=(int(viewpoint_cam.image_height), int(viewpoint_cam.image_width)),
+            mode=args.stpr_feature_upsample_mode,
+            align_corners=False if args.stpr_feature_upsample_mode in ("bilinear", "bicubic") else None,
+        ).squeeze(0)
     return fmap
 
 def semantic_feature_render_loss(viewpoint_cam, gaussians, pipe, args):
@@ -1051,6 +1058,7 @@ if __name__ == "__main__":
     parser.add_argument("--stpr_feature_source", choices=["precomputed", "image_rgb"], default="precomputed")
     parser.add_argument("--stpr_feature_dir", type=str, default="")
     parser.add_argument("--stpr_feature_layout", choices=["auto", "chw", "hwc"], default="auto")
+    parser.add_argument("--stpr_feature_upsample_mode", choices=["nearest", "bilinear", "bicubic"], default="bilinear")
     parser.add_argument("--stpr_feature_weight", type=float, default=1.0)
     parser.add_argument("--stpr_xyz_weight", type=float, default=0.25)
     parser.add_argument("--stpr_feature_max_cameras", type=int, default=32)
