@@ -928,8 +928,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
                 elif process_state == "appgs":
-                    appgs.max_radii2D[visibility_filter] = torch.max(appgs.max_radii2D[visibility_filter], radii[visibility_filter])
-                    appgs.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                    app_object_visible_filter = visibility_filter & gaussian_projects_inside_mask(appgs, viewpoint_cam, args.device, args.appgs_object_mask_threshold)
+                    appgs.max_radii2D[app_object_visible_filter] = torch.max(appgs.max_radii2D[app_object_visible_filter], radii[app_object_visible_filter])
+                    appgs.add_densification_stats(viewspace_point_tensor, app_object_visible_filter)
                     stprs.max_radii2D[visibility_filter_stprs] = torch.max(stprs.max_radii2D[visibility_filter_stprs], radii_stprs[visibility_filter_stprs])
                     stprs.add_densification_stats(stprs._xyz, visibility_filter_stprs)
                     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
@@ -945,6 +946,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         else:
                             stprs.densify_and_prune(grad_threshold_stpr, 0.005, scene.cameras_extent, size_threshold, radii_stprs, only_prune=True,flag='stpr')
                         gaussians_init.update_nn_between_appgs_and_stprs()
+                    if args.appgs_mask_prune_interval > 0 and iteration % args.appgs_mask_prune_interval == 0:
+                        scores, visible_count, used_cameras = gaussian_mask_visibility_scores(appgs, scene.getTrainCameras(), args.device, args.appgs_mask_prune_max_cameras)
+                        if used_cameras > 0:
+                            prune_bg = (scores < args.appgs_mask_prune_threshold) & (visible_count >= args.appgs_mask_prune_min_views)
+                            if prune_bg.any() and prune_bg.sum() < prune_bg.shape[0]:
+                                print(f"[STAGE D] Pruning {int(prune_bg.sum().item())} mask-unsupported AppGS.")
+                                appgs.tmp_radii = torch.zeros((appgs.get_xyz.shape[0],), device=args.device)
+                                appgs.prune_points(prune_bg, flag='app')
+                                gaussians_init.update_nn_between_appgs_and_stprs()
                
             # Optimizer step
             if iteration < opt.iterations:
@@ -1099,6 +1109,11 @@ if __name__ == "__main__":
     parser.add_argument("--stpr_semantic_temperature", type=float, default=0.07)
     parser.add_argument("--object_mask_threshold", type=float, default=0.5)
     parser.add_argument("--object_mask_min_views", type=int, default=1)
+    parser.add_argument("--appgs_object_mask_threshold", type=float, default=0.5)
+    parser.add_argument("--appgs_mask_prune_interval", type=int, default=500)
+    parser.add_argument("--appgs_mask_prune_threshold", type=float, default=0.35)
+    parser.add_argument("--appgs_mask_prune_min_views", type=int, default=2)
+    parser.add_argument("--appgs_mask_prune_max_cameras", type=int, default=64)
     parser.add_argument("--stpr_min_clusters", type=int, default=10)
     parser.add_argument("--stpr_max_clusters", type=int, default=1000)
     parser.add_argument("--stpr_min_scale_ratio", type=float, default=1e-5)
