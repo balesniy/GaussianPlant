@@ -851,10 +851,21 @@ def build_mst_from_endpoints(top, bottom, k:int=16):
     mst_w     = T_csr.data  
     return mst_edges, points
 
-def save_mst_ply(points, edges, path='mst.ply'):
+def save_mst_ply(points, edges, path='mst.ply', samples_per_edge=12):
     from plyfile import PlyElement, PlyData
-    v = np.empty(points.shape[0], dtype=[('x','f4'),('y','f4'),('z','f4')])
-    v['x'], v['y'], v['z'] = points.T
+    display_points = [points.astype(np.float32)]
+    if edges.shape[0] > 0 and samples_per_edge > 0:
+        t = np.linspace(0.0, 1.0, samples_per_edge, dtype=np.float32)
+        edge_points = []
+        for i, j in edges:
+            p0 = points[int(i)]
+            p1 = points[int(j)]
+            edge_points.append((1.0 - t[:, None]) * p0[None] + t[:, None] * p1[None])
+        display_points.append(np.concatenate(edge_points, axis=0).astype(np.float32))
+    display_points = np.concatenate(display_points, axis=0)
+
+    v = np.empty(display_points.shape[0], dtype=[('x','f4'),('y','f4'),('z','f4')])
+    v['x'], v['y'], v['z'] = display_points.T
     e = np.empty(edges.shape[0], dtype=[('vertex1','u4'),('vertex2','u4')])
     e['vertex1'] = edges[:,0];  e['vertex2'] = edges[:,1]
     PlyData([PlyElement.describe(v,'vertex'),

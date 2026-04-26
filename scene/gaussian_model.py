@@ -1931,12 +1931,14 @@ class GaussianModel:
             loss_bind = self.build_surface(plant_prior=plant_prior)
             return loss_bind
 
-    def stpr_to_graph(self,opacity_threshold=0, anisotrpopy_threshold=1,save_mst=False):  # 0.2 ,30
+    def stpr_to_graph(self,opacity_threshold=0, anisotrpopy_threshold=1,save_mst=False, min_branch_candidates=16):  # 0.2 ,30
         # MST for grpah extraction
         # step1: Noise filtering
         if self.structure_gs._pst_logit is not None:
-            branch_mask = torch.sigmoid(self.structure_gs._pst_logit).view(-1) > 0.5
+            p_branch = torch.sigmoid(self.structure_gs._pst_logit).view(-1)
+            branch_mask = p_branch > 0.5
         else:
+            p_branch = None
             branch_mask = torch.tensor([lbl == 'branch' for lbl in self.structure_gs.stpr_label], device=self.device)
         stpr_opcaity = self.structure_gs._opacity
         # keep = stpr_opcaity > opacity_threshold # low opacity filter
@@ -1948,6 +1950,25 @@ class GaussianModel:
         
         # step2: stpr to edge
         keep = keep & branch_mask
+        if int(keep.sum().item()) < min_branch_candidates and self.structure_gs.get_xyz.shape[0] >= 2:
+            fallback_pool = (anisotropy > anisotrpopy_threshold).flatten()
+            if not fallback_pool.any():
+                fallback_pool = torch.ones_like(keep, dtype=torch.bool)
+            pool_idx = torch.nonzero(fallback_pool, as_tuple=False).view(-1)
+            if p_branch is not None:
+                aniso_score = torch.log(anisotropy.flatten().clamp(min=1.0))
+                aniso_score = aniso_score / aniso_score.max().clamp(min=1e-6)
+                score = p_branch + 0.25 * aniso_score
+            else:
+                score = anisotropy.flatten()
+            k = min(max(min_branch_candidates, int(branch_mask.sum().item())), pool_idx.shape[0])
+            selected = pool_idx[torch.topk(score[pool_idx], k=k, largest=True).indices]
+            keep = torch.zeros_like(keep, dtype=torch.bool)
+            keep[selected] = True
+            print(
+                f"[DEBUG][graph] branch candidates below {min_branch_candidates}; "
+                f"using top-{k} soft/elongated StPr candidates for graph debug."
+            )
         print(f"[DEBUG][graph] num branch StPr after pruning={int(keep.sum().item())}")
         if not keep.any():
             empty_points = np.empty((0, 3), dtype=np.float32)

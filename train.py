@@ -573,9 +573,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 log_pipeline_stats("appgs_init", appgs, scene.cameras_extent)
                 if stprs.stpr_label is not None:
                     if stprs._pst_logit is not None:
-                        branch_mask = torch.sigmoid(stprs._pst_logit).view(-1) > 0.5
+                        p_branch = torch.sigmoid(stprs._pst_logit).view(-1)
+                        branch_mask = p_branch > 0.5
                     else:
+                        p_branch = None
                         branch_mask = torch.tensor([lbl == "branch" for lbl in stprs.stpr_label], dtype=torch.bool, device=args.device)
+                    if int(branch_mask.sum().item()) < args.graph_min_branch_candidates and stprs.get_xyz.shape[0] >= 2:
+                        scales = stprs.get_scaling
+                        anisotropy = scales[:, 0] / scales[:, 1].clamp(min=1e-8)
+                        anisotropy = torch.max(anisotropy, 1.0 / anisotropy.clamp(min=1e-8))
+                        if p_branch is not None:
+                            aniso_score = torch.log(anisotropy.clamp(min=1.0))
+                            aniso_score = aniso_score / aniso_score.max().clamp(min=1e-6)
+                            score = p_branch + 0.25 * aniso_score
+                        else:
+                            score = anisotropy
+                        k = min(args.graph_min_branch_candidates, stprs.get_xyz.shape[0])
+                        selected = torch.topk(score, k=k, largest=True).indices
+                        branch_mask = torch.zeros_like(branch_mask, dtype=torch.bool)
+                        branch_mask[selected] = True
+                        print(f"[DEBUG][stpr] branch labels below {args.graph_min_branch_candidates}; saving top-{k} soft/elongated candidates.")
                     print(f"[DEBUG][stpr] num branch labels={int(branch_mask.sum().item())} num leaf labels={int((~branch_mask).sum().item())}")
                     if branch_mask.any():
                         stprs.clone_subset(branch_mask, copy_structure_metadata=True).gs_to_graph(
@@ -584,7 +601,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if appgs.app_label is not None:
                     num_branch_appgs = sum(lbl == "branch" for lbl in appgs.app_label)
                     print(f"[DEBUG][appgs] num branch AppGS={num_branch_appgs}")
-                mst_edges, mst_points, _ = gaussians_init.stpr_to_graph()
+                mst_edges, mst_points, _ = gaussians_init.stpr_to_graph(min_branch_candidates=args.graph_min_branch_candidates)
                 save_mst_ply(mst_points, mst_edges, os.path.join(scene.model_path, "branch_graph_final.ply"))
                 gaussians_init.save_ply(os.path.join(args.source_path, "points_3dgs_object.ply"))
                 stage_c_start_iter = iteration
@@ -836,7 +853,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss_opacity_stprs = stprs.opacity_regularizer()
                     loss += loss_opacity_app * opt.lambda_opacity + loss_opacity_stprs * opt.lambda_opacity
                 if args.reg_mst:
-                    _,_,loss_mst = gaussians_init.stpr_to_graph()
+                    _,_,loss_mst = gaussians_init.stpr_to_graph(min_branch_candidates=args.graph_min_branch_candidates)
                     loss += loss_mst * opt.lambda_mst
                 
             loss_bind = gaussians_init.compute_gaussian_binding_loss(method='surface', plant_prior="branch_only" if args.no_leaf_mode else args.plant_prior)
@@ -1104,6 +1121,7 @@ if __name__ == "__main__":
     parser.add_argument("--geometry_tangent_threshold", type=float, default=0.55)
     parser.add_argument("--geometry_radius_threshold", type=float, default=0.8)
     parser.add_argument("--geometry_radius_graph_r", type=float, default=0.0)
+    parser.add_argument("--graph_min_branch_candidates", type=int, default=16)
     parser.add_argument('--gpu', type=int, default=0, help='Index of GPU device to use.')
     parser.add_argument("--reg_mask", action="store_true", default=False)
     parser.add_argument("--reg_align", action="store_true", default=False)
