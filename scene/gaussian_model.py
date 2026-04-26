@@ -1088,12 +1088,15 @@ class GaussianModel:
         stpr_scales[torch.isnan(stpr_scales)] = 0.1
         stpr_sur_rots = torch.tensor(np.array(surf_rotations), dtype=torch.float, device=self.device)
         print(f"[DEBUG][stpr] num StPr before scale_filter={stpr_scales.shape[0]}")
-        print(f"[DEBUG][stpr] mean/max scale per StPr={stpr_scales.mean(dim=1).detach().cpu().numpy().tolist()} / {stpr_scales.max(dim=1).values.detach().cpu().numpy().tolist()}")
         if scene_extent is None:
             extent_tensor = stpr_positions.max(dim=0).values - stpr_positions.min(dim=0).values
             scene_extent = float(torch.linalg.norm(extent_tensor).detach().cpu())
         print(f"[DEBUG][stpr] scene extent={scene_extent:.6g}")
         max_scale = stpr_scales.max(dim=1).values
+        print(
+            f"[DEBUG][stpr] scale summary min/mean/max="
+            f"{max_scale.min().item():.6g}/{max_scale.mean().item():.6g}/{max_scale.max().item():.6g}"
+        )
         scale_filter = (max_scale < stpr_max_scale_ratio * scene_extent) & (max_scale > stpr_min_scale_ratio * scene_extent)
         if not scale_filter.any():
             print("Warning: scale filter would remove all StPrs; keeping unfiltered primitives.")
