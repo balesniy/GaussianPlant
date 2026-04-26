@@ -1111,6 +1111,209 @@ def reparent_backtracking_branches(points, edges, back_angle_degrees=25.0, hairp
     old_to_new[used] = np.arange(int(used.sum()), dtype=np.int32)
     return points[used].copy(), old_to_new[final_edges].astype(np.int32), surgery_count
 
+def refine_fruit_tree_graph(points, edges, root_axis=2, trunk_height_weight=1.0, trunk_distance_weight=0.25,
+                            prune_min_length=0.25, prune_min_support=3, smooth_iters=5, smooth_lambda=0.35):
+    """Apply fruit-tree priors: rooted trunk, short twig pruning, and chain smoothing."""
+    points = np.asarray(points, dtype=np.float32)
+    edges = np.asarray(edges, dtype=np.int32)
+    if points.shape[0] == 0 or edges.shape[0] == 0:
+        return points.copy(), edges.copy(), {
+            "trunk_nodes": 0,
+            "pruned_nodes": 0,
+            "connected_components_before": 0,
+            "smooth_iters": 0,
+        }
+
+    def edge_key(a, b):
+        return tuple(sorted((int(a), int(b))))
+
+    def compact_graph(pts, edge_set):
+        if not edge_set:
+            return pts[:0].copy(), np.empty((0, 2), dtype=np.int32)
+        out_edges = np.asarray(sorted(edge_set), dtype=np.int32)
+        used = np.zeros(pts.shape[0], dtype=bool)
+        used[out_edges.reshape(-1)] = True
+        old_to_new = np.full(pts.shape[0], -1, dtype=np.int32)
+        old_to_new[used] = np.arange(int(used.sum()), dtype=np.int32)
+        return pts[used].copy(), old_to_new[out_edges].astype(np.int32)
+
+    def build_adjacency(edge_set, n_points):
+        adjacency = [set() for _ in range(n_points)]
+        for a, b in edge_set:
+            adjacency[a].add(b)
+            adjacency[b].add(a)
+        return adjacency
+
+    def orient_components(pts, edge_set):
+        adjacency = build_adjacency(edge_set, pts.shape[0])
+        axis = int(np.clip(root_axis, 0, 2))
+        parent = np.full(pts.shape[0], -1, dtype=np.int32)
+        dist = np.zeros(pts.shape[0], dtype=np.float32)
+        root_of = np.full(pts.shape[0], -1, dtype=np.int32)
+        roots = []
+        visited = np.zeros(pts.shape[0], dtype=bool)
+        for start in range(pts.shape[0]):
+            if visited[start] or not adjacency[start]:
+                continue
+            stack = [start]
+            component = []
+            visited[start] = True
+            while stack:
+                u = stack.pop()
+                component.append(u)
+                for v in adjacency[u]:
+                    if not visited[v]:
+                        visited[v] = True
+                        stack.append(v)
+            root = min(component, key=lambda idx: pts[idx, axis])
+            roots.append(root)
+            queue = [root]
+            parent[root] = root
+            root_of[root] = root
+            for u in queue:
+                for v in adjacency[u]:
+                    if parent[v] == -1:
+                        parent[v] = u
+                        root_of[v] = root
+                        dist[v] = dist[u] + float(np.linalg.norm(pts[v] - pts[u]))
+                        queue.append(v)
+        return adjacency, parent, dist, roots, root_of
+
+    valid = (
+        (edges[:, 0] >= 0) & (edges[:, 1] >= 0) &
+        (edges[:, 0] < points.shape[0]) & (edges[:, 1] < points.shape[0]) &
+        (edges[:, 0] != edges[:, 1])
+    )
+    edge_set = {edge_key(a, b) for a, b in edges[valid]}
+    adjacency, parent, dist, roots, root_of = orient_components(points, edge_set)
+    axis = int(np.clip(root_axis, 0, 2))
+    connected_components_before = len(roots)
+    if len(roots) > 1:
+        global_root = min(roots, key=lambda idx: points[idx, axis])
+        main_nodes = list(np.flatnonzero(root_of == global_root))
+        for root in roots:
+            if root == global_root:
+                continue
+            component_nodes = np.flatnonzero(root_of == root)
+            if len(component_nodes) == 0 or len(main_nodes) == 0:
+                continue
+            tree = cKDTree(points[main_nodes])
+            distances, nearest = tree.query(points[component_nodes], k=1)
+            best_local = int(np.argmin(distances))
+            edge_set.add(edge_key(component_nodes[best_local], main_nodes[int(nearest[best_local])]))
+            main_nodes.extend(component_nodes.tolist())
+        adjacency, parent, dist, roots, root_of = orient_components(points, edge_set)
+
+    trunk_nodes = set()
+    for root in roots:
+        component_nodes = np.flatnonzero(root_of == root)
+        if not component_nodes:
+            continue
+        root_height = float(points[root, axis])
+        scores = []
+        for idx in component_nodes:
+            if parent[idx] < 0:
+                continue
+            height_gain = max(0.0, float(points[idx, axis]) - root_height)
+            score = trunk_height_weight * height_gain + trunk_distance_weight * float(dist[idx])
+            scores.append((score, idx))
+        if not scores:
+            continue
+        target = max(scores, key=lambda item: item[0])[1]
+        cur = int(target)
+        while parent[cur] >= 0 and cur not in trunk_nodes:
+            trunk_nodes.add(cur)
+            if parent[cur] == cur:
+                break
+            cur = int(parent[cur])
+
+    pruned_nodes = set()
+    changed = True
+    while changed:
+        changed = False
+        adjacency = build_adjacency(edge_set, points.shape[0])
+        parent = orient_components(points, edge_set)[1]
+        leaves = [idx for idx, nbrs in enumerate(adjacency) if len(nbrs) == 1 and idx not in trunk_nodes]
+        for leaf in leaves:
+            path = [leaf]
+            length = 0.0
+            cur = int(leaf)
+            while parent[cur] >= 0 and parent[cur] != cur:
+                p = int(parent[cur])
+                length += float(np.linalg.norm(points[cur] - points[p]))
+                path.append(p)
+                if p in trunk_nodes or len(adjacency[p]) != 2:
+                    break
+                cur = p
+            support = len(path) - 1
+            if support <= 0:
+                continue
+            if length < prune_min_length and support < prune_min_support:
+                for node in path[:-1]:
+                    if node in trunk_nodes:
+                        continue
+                    for nbr in list(adjacency[node]):
+                        edge_set.discard(edge_key(node, nbr))
+                    pruned_nodes.add(node)
+                changed = True
+
+    refined_points, refined_edges = compact_graph(points, edge_set)
+    if refined_edges.shape[0] == 0:
+        return refined_points, refined_edges, {
+            "trunk_nodes": len(trunk_nodes),
+            "pruned_nodes": len(pruned_nodes),
+            "connected_components_before": connected_components_before,
+            "smooth_iters": 0,
+        }
+
+    edge_set = {edge_key(a, b) for a, b in refined_edges}
+    adjacency, parent, _, roots, _ = orient_components(refined_points, edge_set)
+    trunk_nodes = set()
+    for root in roots:
+        component = []
+        stack = [root]
+        seen = {root}
+        while stack:
+            u = stack.pop()
+            component.append(u)
+            for v in adjacency[u]:
+                if v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        if not component:
+            continue
+        root_height = float(refined_points[root, axis])
+        target = max(
+            component,
+            key=lambda idx: trunk_height_weight * max(0.0, float(refined_points[idx, axis]) - root_height),
+        )
+        cur = int(target)
+        while parent[cur] >= 0:
+            trunk_nodes.add(cur)
+            if parent[cur] == cur:
+                break
+            cur = int(parent[cur])
+
+    smoothed = refined_points.copy()
+    smooth_lambda = float(np.clip(smooth_lambda, 0.0, 1.0))
+    if smooth_iters > 0 and smooth_lambda > 0:
+        for _ in range(int(smooth_iters)):
+            adjacency = build_adjacency(edge_set, smoothed.shape[0])
+            updated = smoothed.copy()
+            for idx, nbrs in enumerate(adjacency):
+                if idx in trunk_nodes or len(nbrs) != 2:
+                    continue
+                mean_neighbor = smoothed[list(nbrs)].mean(axis=0)
+                updated[idx] = (1.0 - smooth_lambda) * smoothed[idx] + smooth_lambda * mean_neighbor
+            smoothed = updated
+
+    return smoothed.astype(np.float32), refined_edges.astype(np.int32), {
+        "trunk_nodes": len(trunk_nodes),
+        "pruned_nodes": len(pruned_nodes),
+        "connected_components_before": connected_components_before,
+        "smooth_iters": int(smooth_iters),
+    }
+
 def save_mst_ply(points, edges, path='mst.ply', samples_per_edge=12):
     from plyfile import PlyElement, PlyData
     display_points = [points.astype(np.float32)]

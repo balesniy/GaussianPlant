@@ -11,7 +11,7 @@ from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr, save_tensor_as_image
-from utils.gs_utils import save_mst_ply, simplify_tree_edges, reparent_backtracking_branches
+from utils.gs_utils import save_mst_ply, simplify_tree_edges, reparent_backtracking_branches, refine_fruit_tree_graph
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from pytorch3d.loss import chamfer_distance
@@ -90,6 +90,48 @@ def background_alpha_rgb_loss(viewpoint_cam, gaussians, image, bg, pipe, args, o
     outside_rgb_loss = (torch.abs(image - bg_target) * outside_mask).sum() / (outside_sum * image.shape[0])
     return lambda_bg_alpha_eff * outside_alpha_loss + opt.lambda_bg_rgb * outside_rgb_loss
 
+def depth_weighted_background_alpha_loss(viewpoint_cam, gaussians, pipe, args, iteration):
+    lambda_eff = ramp_weight(
+        iteration,
+        args.lambda_depth_bg_alpha,
+        args.depth_bg_ramp_start,
+        args.depth_bg_ramp_end,
+    )
+    if (
+        lambda_eff <= 0
+        or not getattr(viewpoint_cam, "has_alpha_mask", False)
+        or not getattr(viewpoint_cam, "depth_reliable", False)
+    ):
+        return torch.tensor(0.0, device=args.device)
+
+    with torch.no_grad():
+        object_mask = viewpoint_cam.alpha_mask.to(args.device).clamp(0.0, 1.0)
+        object_mask = dilate_mask(object_mask, args.depth_bg_mask_dilate_radius)
+        outside_mask = (1.0 - object_mask).clamp(0.0, 1.0)
+        mono_invdepth = viewpoint_cam.invdepthmap.to(args.device)
+        valid_depth = mono_invdepth > args.depth_bg_min_invdepth
+        object_depth_pixels = mono_invdepth[(object_mask > args.depth_bg_object_mask_threshold) & valid_depth]
+
+        if object_depth_pixels.numel() == 0:
+            return torch.tensor(0.0, device=args.device)
+
+        object_frontier = torch.quantile(
+            object_depth_pixels.float(),
+            args.depth_bg_object_invdepth_quantile,
+        )
+        far_gap = (object_frontier - mono_invdepth - args.depth_bg_margin).clamp(min=0.0)
+        if args.depth_bg_hard_far_only:
+            outside_mask = outside_mask * (far_gap > 0).float()
+
+        denom_gap = object_frontier.abs().clamp(min=1e-6)
+        depth_weight = 1.0 + args.depth_bg_gain * torch.pow(far_gap / denom_gap, args.depth_bg_power)
+        depth_weight = depth_weight.clamp(max=args.depth_bg_max_weight)
+        penalty_mask = outside_mask * valid_depth.float() * depth_weight
+        penalty_sum = penalty_mask.sum().clamp(min=1.0)
+
+    rendered_alpha = render_alpha_approx(viewpoint_cam, gaussians, pipe, args.device)
+    return lambda_eff * (rendered_alpha * penalty_mask).sum() / penalty_sum
+
 def render_semantic_object(viewpoint_cam, gaussians, pipe, device):
     semantic_color = gaussians.get_semantic.repeat(1, 3)
     semantic_pkg = render(
@@ -137,7 +179,32 @@ def project_gaussians_to_camera(xyz, camera):
     in_bounds = (raw_w > 0) & (x >= 0) & (x <= camera.image_width - 1) & (y >= 0) & (y <= camera.image_height - 1)
     return x, y, in_bounds
 
-def gaussian_mask_visibility_scores(gaussians, cameras, device, max_cameras=64):
+def sampled_object_depth_support(camera, grid, args, device):
+    if (
+        args is None
+        or getattr(args, "disable_depth_object_filter", False)
+        or not getattr(camera, "has_alpha_mask", False)
+        or not getattr(camera, "depth_reliable", False)
+    ):
+        return torch.ones((grid.shape[1],), dtype=torch.bool, device=device)
+
+    with torch.no_grad():
+        mono_invdepth = camera.invdepthmap.to(device)
+        mask = camera.alpha_mask.to(device).clamp(0.0, 1.0)
+        valid_depth = mono_invdepth > args.depth_bg_min_invdepth
+        object_depth_pixels = mono_invdepth[(mask > args.depth_bg_object_mask_threshold) & valid_depth]
+        if object_depth_pixels.numel() == 0:
+            return torch.ones((grid.shape[1],), dtype=torch.bool, device=device)
+        object_frontier = torch.quantile(
+            object_depth_pixels.float(),
+            args.depth_bg_object_invdepth_quantile,
+        )
+        sampled_invdepth = F.grid_sample(mono_invdepth.unsqueeze(0), grid, align_corners=True).view(-1)
+        return (sampled_invdepth > args.depth_bg_min_invdepth) & (
+            sampled_invdepth >= object_frontier - args.depth_bg_margin
+        )
+
+def gaussian_mask_visibility_scores(gaussians, cameras, device, max_cameras=64, args=None):
     xyz = gaussians.get_xyz.detach()
     score_sum = torch.zeros((xyz.shape[0],), dtype=torch.float32, device=device)
     visible_count = torch.zeros_like(score_sum)
@@ -153,14 +220,15 @@ def gaussian_mask_visibility_scores(gaussians, cameras, device, max_cameras=64):
         grid_y = (y[in_bounds] / max(camera.image_height - 1, 1)) * 2.0 - 1.0
         grid = torch.stack([grid_x, grid_y], dim=-1).view(1, -1, 1, 2)
         sampled = F.grid_sample(mask, grid, align_corners=True).view(-1)
+        sampled = sampled * sampled_object_depth_support(camera, grid, args, device).float()
         score_sum[in_bounds] += sampled
         visible_count[in_bounds] += 1.0
         used += 1
     scores = score_sum / visible_count.clamp(min=1.0)
     return scores, visible_count, used
 
-def filter_gaussians_by_masks(gaussians, cameras, threshold, min_views, device):
-    scores, visible_count, used_cameras = gaussian_mask_visibility_scores(gaussians, cameras, device)
+def filter_gaussians_by_masks(gaussians, cameras, threshold, min_views, device, args=None):
+    scores, visible_count, used_cameras = gaussian_mask_visibility_scores(gaussians, cameras, device, args=args)
     if used_cameras == 0:
         print("[DEBUG][object-filter] no object masks found; using all gaussians for StPr initialization.")
         return gaussians, torch.ones((gaussians.get_xyz.shape[0],), dtype=torch.bool, device=device)
@@ -177,7 +245,7 @@ def filter_gaussians_by_masks(gaussians, cameras, threshold, min_views, device):
     )
     return filtered, keep
 
-def gaussian_projects_inside_mask(gaussians, camera, device, threshold=0.5):
+def gaussian_projects_inside_mask(gaussians, camera, device, threshold=0.5, args=None):
     if not getattr(camera, "has_alpha_mask", False):
         return torch.ones((gaussians.get_xyz.shape[0],), dtype=torch.bool, device=device)
     x, y, in_bounds = project_gaussians_to_camera(gaussians.get_xyz.detach(), camera)
@@ -189,7 +257,7 @@ def gaussian_projects_inside_mask(gaussians, camera, device, threshold=0.5):
     grid_y = (y[in_bounds] / max(camera.image_height - 1, 1)) * 2.0 - 1.0
     grid = torch.stack([grid_x, grid_y], dim=-1).view(1, -1, 1, 2)
     sampled = F.grid_sample(mask, grid, align_corners=True).view(-1)
-    result[in_bounds] = sampled >= threshold
+    result[in_bounds] = (sampled >= threshold) & sampled_object_depth_support(camera, grid, args, device)
     return result
 
 def find_feature_map_path(feature_dir, image_name):
@@ -591,6 +659,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     args.object_mask_threshold,
                     args.object_mask_min_views,
                     args.device,
+                    args,
                 )
                 gaussians_for_stpr.save_ply(os.path.join(scene.model_path, "object_filtered_3dgs.ply"))
                 log_pipeline_stats("object-filtered 3DGS", gaussians_for_stpr, scene.cameras_extent)
@@ -685,11 +754,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     max_passes=args.graph_reparent_max_passes,
                     root_axis=args.graph_reparent_root_axis,
                 )
+                simplified_points, simplified_edges, tree_stats = refine_fruit_tree_graph(
+                    simplified_points,
+                    simplified_edges,
+                    root_axis=args.tree_root_axis,
+                    trunk_height_weight=args.tree_trunk_weight_height,
+                    trunk_distance_weight=args.tree_trunk_weight_distance,
+                    prune_min_length=args.tree_prune_min_length,
+                    prune_min_support=args.tree_prune_min_support,
+                    smooth_iters=args.tree_smooth_iters,
+                    smooth_lambda=args.tree_smooth_lambda,
+                )
                 print(
                     f"[DEBUG][graph] simplified final graph: "
                     f"points={mst_points.shape[0]}->{simplified_points.shape[0]} "
                     f"edges={mst_edges.shape[0]}->{simplified_edges.shape[0]} "
-                    f"reparented={reparent_count}"
+                    f"reparented={reparent_count} "
+                    f"components_before_tree_refine={tree_stats['connected_components_before']} "
+                    f"trunk_nodes={tree_stats['trunk_nodes']} "
+                    f"pruned_twigs={tree_stats['pruned_nodes']}"
                 )
                 save_mst_ply(simplified_points, simplified_edges, os.path.join(scene.model_path, "branch_graph_final.ply"))
                 gaussians_init.save_ply(os.path.join(args.source_path, "points_3dgs_object.ply"))
@@ -766,6 +849,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
             loss += background_alpha_rgb_loss(viewpoint_cam, gaussians_init, image, bg, pipe, args, opt, iteration)
+            loss += depth_weighted_background_alpha_loss(viewpoint_cam, gaussians_init, pipe, args, iteration)
             if opt.lambda_obj_sem > 0:
                 loss += opt.lambda_obj_sem * object_semantic_loss(viewpoint_cam, gaussians_init, pipe, args.device)
             
@@ -828,6 +912,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             else:
                 ssim_value = ssim(masked_image, masked_gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+            loss += depth_weighted_background_alpha_loss(viewpoint_cam, stprs, pipe, args, iteration)
             if opt.lambda_obj_sem > 0:
                 loss += opt.lambda_obj_sem * object_semantic_loss(viewpoint_cam, stprs, pipe, args.device)
             if args.lambda_dino_sem > 0:
@@ -898,6 +983,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1_stpr = masked_l1_loss(image_stprs, gt_image, mask) if mask is not None else l1_loss(image_stprs, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + 0.1 * Ll1_stpr
             loss += background_alpha_rgb_loss(viewpoint_cam, appgs, image, bg, pipe, args, opt, iteration)
+            loss += depth_weighted_background_alpha_loss(viewpoint_cam, appgs, pipe, args, iteration)
+            loss += depth_weighted_background_alpha_loss(viewpoint_cam, stprs, pipe, args, iteration)
             if opt.lambda_obj_sem > 0:
                 loss += opt.lambda_obj_sem * object_semantic_loss(viewpoint_cam, appgs, pipe, args.device)
             if args.lambda_dino_sem > 0:
@@ -983,7 +1070,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.densify_until_iter:
                 if process_state == "init":
                 # Keep track of max radii in image-space for pruning
-                    object_visible_filter = visibility_filter & gaussian_projects_inside_mask(gaussians_init, viewpoint_cam, args.device, args.object_mask_threshold)
+                    object_visible_filter = visibility_filter & gaussian_projects_inside_mask(gaussians_init, viewpoint_cam, args.device, args.object_mask_threshold, args)
                     gaussians_init.max_radii2D[object_visible_filter] = torch.max(gaussians_init.max_radii2D[object_visible_filter], radii[object_visible_filter])
                     gaussians_init.add_densification_stats(viewspace_point_tensor, object_visible_filter)
                 
@@ -991,7 +1078,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                         gaussians_init.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, flag=None)
                     if args.background_prune_interval > 0 and iteration > opt.densify_from_iter and iteration % args.background_prune_interval == 0:
-                        scores, visible_count, used_cameras = gaussian_mask_visibility_scores(gaussians_init, scene.getTrainCameras(), args.device)
+                        scores, visible_count, used_cameras = gaussian_mask_visibility_scores(gaussians_init, scene.getTrainCameras(), args.device, args=args)
                         if used_cameras > 0:
                             prune_bg = (scores < args.background_prune_threshold) & (visible_count >= args.object_mask_min_views)
                             if prune_bg.any() and prune_bg.sum() < prune_bg.shape[0]:
@@ -1017,7 +1104,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
                 elif process_state == "appgs":
-                    app_object_visible_filter = visibility_filter & gaussian_projects_inside_mask(appgs, viewpoint_cam, args.device, args.appgs_object_mask_threshold)
+                    app_object_visible_filter = visibility_filter & gaussian_projects_inside_mask(appgs, viewpoint_cam, args.device, args.appgs_object_mask_threshold, args)
                     appgs.max_radii2D[app_object_visible_filter] = torch.max(appgs.max_radii2D[app_object_visible_filter], radii[app_object_visible_filter])
                     appgs.add_densification_stats(viewspace_point_tensor, app_object_visible_filter)
                     stprs.max_radii2D[visibility_filter_stprs] = torch.max(stprs.max_radii2D[visibility_filter_stprs], radii_stprs[visibility_filter_stprs])
@@ -1036,7 +1123,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             stprs.densify_and_prune(grad_threshold_stpr, 0.005, scene.cameras_extent, size_threshold, radii_stprs, only_prune=True,flag='stpr')
                         gaussians_init.update_nn_between_appgs_and_stprs()
                     if args.appgs_mask_prune_interval > 0 and iteration % args.appgs_mask_prune_interval == 0:
-                        scores, visible_count, used_cameras = gaussian_mask_visibility_scores(appgs, scene.getTrainCameras(), args.device, args.appgs_mask_prune_max_cameras)
+                        scores, visible_count, used_cameras = gaussian_mask_visibility_scores(appgs, scene.getTrainCameras(), args.device, args.appgs_mask_prune_max_cameras, args=args)
                         if used_cameras > 0:
                             prune_bg = (scores < args.appgs_mask_prune_threshold) & (visible_count >= args.appgs_mask_prune_min_views)
                             if prune_bg.any() and prune_bg.sum() < prune_bg.shape[0]:
@@ -1222,6 +1309,19 @@ if __name__ == "__main__":
     parser.add_argument("--mask_dilate_radius", type=int, default=3)
     parser.add_argument("--bg_alpha_ramp_start", type=int, default=1000)
     parser.add_argument("--bg_alpha_ramp_end", type=int, default=5000)
+    parser.add_argument("--lambda_depth_bg_alpha", type=float, default=0.05)
+    parser.add_argument("--depth_bg_ramp_start", type=int, default=500)
+    parser.add_argument("--depth_bg_ramp_end", type=int, default=4000)
+    parser.add_argument("--depth_bg_mask_dilate_radius", type=int, default=1)
+    parser.add_argument("--depth_bg_object_mask_threshold", type=float, default=0.5)
+    parser.add_argument("--depth_bg_object_invdepth_quantile", type=float, default=0.15)
+    parser.add_argument("--depth_bg_min_invdepth", type=float, default=1e-6)
+    parser.add_argument("--depth_bg_margin", type=float, default=0.02)
+    parser.add_argument("--depth_bg_gain", type=float, default=8.0)
+    parser.add_argument("--depth_bg_power", type=float, default=1.5)
+    parser.add_argument("--depth_bg_max_weight", type=float, default=20.0)
+    parser.add_argument("--depth_bg_hard_far_only", action="store_true", default=False)
+    parser.add_argument("--disable_depth_object_filter", action="store_true", default=False)
     parser.add_argument("--geometry_refine_labels", action="store_true", default=False)
     parser.add_argument("--geometry_knn", type=int, default=12)
     parser.add_argument("--geometry_cost_threshold", type=float, default=0.55)
@@ -1238,6 +1338,13 @@ if __name__ == "__main__":
     parser.add_argument("--graph_reparent_hairpin_angle", type=float, default=60.0)
     parser.add_argument("--graph_reparent_max_passes", type=int, default=16)
     parser.add_argument("--graph_reparent_root_axis", type=int, default=2)
+    parser.add_argument("--tree_root_axis", type=int, default=2)
+    parser.add_argument("--tree_trunk_weight_height", type=float, default=1.0)
+    parser.add_argument("--tree_trunk_weight_distance", type=float, default=0.25)
+    parser.add_argument("--tree_prune_min_length", type=float, default=0.25)
+    parser.add_argument("--tree_prune_min_support", type=int, default=3)
+    parser.add_argument("--tree_smooth_iters", type=int, default=5)
+    parser.add_argument("--tree_smooth_lambda", type=float, default=0.35)
     parser.add_argument('--gpu', type=int, default=0, help='Index of GPU device to use.')
     parser.add_argument("--reg_mask", action="store_true", default=False)
     parser.add_argument("--reg_align", action="store_true", default=False)
