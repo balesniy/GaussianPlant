@@ -853,6 +853,264 @@ def build_mst_from_endpoints(top, bottom, k:int=16):
     mst_w     = T_csr.data  
     return mst_edges, points
 
+def simplify_tree_edges(points, edges, angle_threshold_degrees=18.0, max_segment_length=0.0, min_edge_length=0.0):
+    """Compress degree-2 chains in a tree while keeping visible bends."""
+    points = np.asarray(points, dtype=np.float32)
+    edges = np.asarray(edges, dtype=np.int32)
+    if points.shape[0] == 0 or edges.shape[0] == 0:
+        return points.copy(), edges.copy()
+
+    if min_edge_length and min_edge_length > 0:
+        parent = np.arange(points.shape[0], dtype=np.int32)
+        rank = np.zeros(points.shape[0], dtype=np.int32)
+
+        def find(x):
+            x = int(x)
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = int(parent[x])
+            return x
+
+        def union(a, b):
+            ra = find(a)
+            rb = find(b)
+            if ra == rb:
+                return
+            if rank[ra] < rank[rb]:
+                ra, rb = rb, ra
+            parent[rb] = ra
+            if rank[ra] == rank[rb]:
+                rank[ra] += 1
+
+        valid = (
+            (edges[:, 0] >= 0) & (edges[:, 1] >= 0) &
+            (edges[:, 0] < points.shape[0]) & (edges[:, 1] < points.shape[0])
+        )
+        for a, b in edges[valid]:
+            if np.linalg.norm(points[int(a)] - points[int(b)]) < min_edge_length:
+                union(a, b)
+
+        roots = np.array([find(i) for i in range(points.shape[0])], dtype=np.int32)
+        _, inverse = np.unique(roots, return_inverse=True)
+        contracted_points = np.zeros((int(inverse.max()) + 1, 3), dtype=np.float32)
+        counts = np.bincount(inverse).astype(np.float32)
+        np.add.at(contracted_points, inverse, points)
+        contracted_points /= np.maximum(counts[:, None], 1.0)
+
+        contracted_edges = np.sort(inverse[edges[valid]], axis=1).astype(np.int32)
+        contracted_edges = contracted_edges[contracted_edges[:, 0] != contracted_edges[:, 1]]
+        if contracted_edges.shape[0] == 0:
+            return contracted_points, contracted_edges
+        points = contracted_points
+        edges = np.unique(contracted_edges, axis=0)
+
+    adjacency = [[] for _ in range(points.shape[0])]
+    for edge_idx, (a, b) in enumerate(edges):
+        a = int(a)
+        b = int(b)
+        if a < 0 or b < 0 or a >= points.shape[0] or b >= points.shape[0] or a == b:
+            continue
+        adjacency[a].append(b)
+        adjacency[b].append(a)
+
+    degrees = np.array([len(nbrs) for nbrs in adjacency], dtype=np.int32)
+    anchors = np.flatnonzero(degrees != 2)
+    if anchors.size == 0:
+        anchors = np.array([0], dtype=np.int32)
+
+    cos_threshold = np.cos(np.deg2rad(float(angle_threshold_degrees)))
+    visited = set()
+    simplified_points = []
+    point_map = {}
+    simplified_edges = []
+
+    def add_point(old_idx):
+        old_idx = int(old_idx)
+        mapped = point_map.get(old_idx)
+        if mapped is None:
+            mapped = len(simplified_points)
+            point_map[old_idx] = mapped
+            simplified_points.append(points[old_idx])
+        return mapped
+
+    def should_keep(path, local_idx, last_kept_local_idx):
+        if local_idx <= 0 or local_idx >= len(path) - 1:
+            return True
+        p_prev = points[path[local_idx - 1]]
+        p_cur = points[path[local_idx]]
+        p_next = points[path[local_idx + 1]]
+        v0 = p_cur - p_prev
+        v1 = p_next - p_cur
+        n0 = np.linalg.norm(v0)
+        n1 = np.linalg.norm(v1)
+        if n0 > 1e-8 and n1 > 1e-8:
+            cos_angle = float(np.dot(v0, v1) / (n0 * n1))
+            if cos_angle < cos_threshold:
+                return True
+        if max_segment_length and max_segment_length > 0:
+            run = 0.0
+            for j in range(last_kept_local_idx, local_idx):
+                run += float(np.linalg.norm(points[path[j + 1]] - points[path[j]]))
+            if run >= max_segment_length:
+                return True
+        return False
+
+    def add_simplified_path(path):
+        kept = [path[0]]
+        last_kept_local_idx = 0
+        for local_idx in range(1, len(path) - 1):
+            if should_keep(path, local_idx, last_kept_local_idx):
+                kept.append(path[local_idx])
+                last_kept_local_idx = local_idx
+        kept.append(path[-1])
+        for a, b in zip(kept[:-1], kept[1:]):
+            ia = add_point(a)
+            ib = add_point(b)
+            if ia != ib:
+                simplified_edges.append((ia, ib))
+
+    for start in anchors:
+        start = int(start)
+        for nxt in adjacency[start]:
+            edge_key = tuple(sorted((start, int(nxt))))
+            if edge_key in visited:
+                continue
+            path = [start, int(nxt)]
+            visited.add(edge_key)
+            prev = start
+            cur = int(nxt)
+            while degrees[cur] == 2:
+                candidates = [n for n in adjacency[cur] if n != prev]
+                if not candidates:
+                    break
+                nxt2 = int(candidates[0])
+                edge_key = tuple(sorted((cur, nxt2)))
+                if edge_key in visited:
+                    break
+                path.append(nxt2)
+                visited.add(edge_key)
+                prev, cur = cur, nxt2
+            add_simplified_path(path)
+
+    if not simplified_edges:
+        return points.copy(), edges.copy()
+
+    return (
+        np.asarray(simplified_points, dtype=np.float32),
+        np.asarray(simplified_edges, dtype=np.int32),
+    )
+
+def reparent_backtracking_branches(points, edges, back_angle_degrees=25.0, hairpin_angle_degrees=60.0,
+                                   max_passes=16, root_axis=2):
+    """Merge near-parallel backward side branches into the parent branch topology."""
+    points = np.asarray(points, dtype=np.float32)
+    edges = np.asarray(edges, dtype=np.int32)
+    if points.shape[0] == 0 or edges.shape[0] == 0:
+        return points.copy(), edges.copy(), 0
+
+    def edge_key(a, b):
+        return tuple(sorted((int(a), int(b))))
+
+    def vector_angle(v0, v1):
+        n0 = np.linalg.norm(v0)
+        n1 = np.linalg.norm(v1)
+        if n0 < 1e-8 or n1 < 1e-8:
+            return None
+        cos_angle = float(np.dot(v0, v1) / (n0 * n1))
+        return float(np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0))))
+
+    def build_adjacency(edge_set):
+        adjacency = [set() for _ in range(points.shape[0])]
+        for a, b in edge_set:
+            adjacency[a].add(b)
+            adjacency[b].add(a)
+        return adjacency
+
+    def parents_from_roots(adjacency):
+        parent = np.full(points.shape[0], -1, dtype=np.int32)
+        visited = np.zeros(points.shape[0], dtype=bool)
+        axis = int(np.clip(root_axis, 0, 2))
+        for start in range(points.shape[0]):
+            if visited[start] or not adjacency[start]:
+                continue
+            stack = [start]
+            component = []
+            visited[start] = True
+            while stack:
+                u = stack.pop()
+                component.append(u)
+                for v in adjacency[u]:
+                    if not visited[v]:
+                        visited[v] = True
+                        stack.append(v)
+            root = min(component, key=lambda idx: points[idx, axis])
+            queue = [root]
+            parent[root] = root
+            for u in queue:
+                for v in adjacency[u]:
+                    if parent[v] == -1:
+                        parent[v] = u
+                        queue.append(v)
+        return parent
+
+    valid = (
+        (edges[:, 0] >= 0) & (edges[:, 1] >= 0) &
+        (edges[:, 0] < points.shape[0]) & (edges[:, 1] < points.shape[0]) &
+        (edges[:, 0] != edges[:, 1])
+    )
+    edge_set = {edge_key(a, b) for a, b in edges[valid]}
+    removed_nodes = set()
+    surgery_count = 0
+
+    for _ in range(max_passes):
+        adjacency = build_adjacency(edge_set)
+        parent = parents_from_roots(adjacency)
+        candidates = []
+        for a_idx in range(points.shape[0]):
+            if a_idx in removed_nodes or len(adjacency[a_idx]) < 3:
+                continue
+            parent_idx = int(parent[a_idx])
+            if parent_idx < 0 or parent_idx == a_idx:
+                continue
+            for b_idx in list(adjacency[a_idx]):
+                if b_idx == parent_idx or b_idx in removed_nodes:
+                    continue
+                b_children = [n for n in adjacency[b_idx] if n != a_idx and n not in removed_nodes]
+                if len(b_children) != 1:
+                    continue
+                c_idx = int(b_children[0])
+                back_angle = vector_angle(points[parent_idx] - points[a_idx], points[b_idx] - points[a_idx])
+                hairpin_angle = vector_angle(points[a_idx] - points[b_idx], points[c_idx] - points[b_idx])
+                if back_angle is None or hairpin_angle is None:
+                    continue
+                if back_angle <= back_angle_degrees and hairpin_angle <= hairpin_angle_degrees:
+                    candidates.append((back_angle, hairpin_angle, a_idx, parent_idx, int(b_idx), c_idx))
+
+        if not candidates:
+            break
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        _, _, a_idx, parent_idx, b_idx, _ = candidates[0]
+        old_neighbors = list(adjacency[a_idx])
+        for neighbor in old_neighbors:
+            edge_set.discard(edge_key(a_idx, neighbor))
+        edge_set.add(edge_key(parent_idx, b_idx))
+        for neighbor in old_neighbors:
+            if neighbor not in (parent_idx, b_idx):
+                edge_set.add(edge_key(b_idx, neighbor))
+        removed_nodes.add(a_idx)
+        surgery_count += 1
+
+    if surgery_count == 0:
+        return points.copy(), np.asarray(sorted(edge_set), dtype=np.int32), 0
+
+    final_edges = np.asarray(sorted(edge_set), dtype=np.int32)
+    used = np.zeros(points.shape[0], dtype=bool)
+    used[final_edges.reshape(-1)] = True
+    old_to_new = np.full(points.shape[0], -1, dtype=np.int32)
+    old_to_new[used] = np.arange(int(used.sum()), dtype=np.int32)
+    return points[used].copy(), old_to_new[final_edges].astype(np.int32), surgery_count
+
 def save_mst_ply(points, edges, path='mst.ply', samples_per_edge=12):
     from plyfile import PlyElement, PlyData
     display_points = [points.astype(np.float32)]

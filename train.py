@@ -11,7 +11,7 @@ from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr, save_tensor_as_image
-from utils.gs_utils import save_mst_ply
+from utils.gs_utils import save_mst_ply, simplify_tree_edges, reparent_backtracking_branches
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from pytorch3d.loss import chamfer_distance
@@ -670,7 +670,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     num_branch_appgs = sum(lbl == "branch" for lbl in appgs.app_label)
                     print(f"[DEBUG][appgs] num branch AppGS={num_branch_appgs}")
                 mst_edges, mst_points, _ = gaussians_init.stpr_to_graph(min_branch_candidates=args.graph_min_branch_candidates)
-                save_mst_ply(mst_points, mst_edges, os.path.join(scene.model_path, "branch_graph_final.ply"))
+                simplified_points, simplified_edges = simplify_tree_edges(
+                    mst_points,
+                    mst_edges,
+                    angle_threshold_degrees=args.graph_simplify_angle,
+                    max_segment_length=args.graph_simplify_max_segment,
+                    min_edge_length=args.graph_contract_edge_length,
+                )
+                simplified_points, simplified_edges, reparent_count = reparent_backtracking_branches(
+                    simplified_points,
+                    simplified_edges,
+                    back_angle_degrees=args.graph_reparent_back_angle,
+                    hairpin_angle_degrees=args.graph_reparent_hairpin_angle,
+                    max_passes=args.graph_reparent_max_passes,
+                    root_axis=args.graph_reparent_root_axis,
+                )
+                print(
+                    f"[DEBUG][graph] simplified final graph: "
+                    f"points={mst_points.shape[0]}->{simplified_points.shape[0]} "
+                    f"edges={mst_edges.shape[0]}->{simplified_edges.shape[0]} "
+                    f"reparented={reparent_count}"
+                )
+                save_mst_ply(simplified_points, simplified_edges, os.path.join(scene.model_path, "branch_graph_final.ply"))
                 gaussians_init.save_ply(os.path.join(args.source_path, "points_3dgs_object.ply"))
                 stage_c_start_iter = iteration
                 stage_c_end_iter = iteration + args.stage_c_iterations
@@ -1210,6 +1231,13 @@ if __name__ == "__main__":
     parser.add_argument("--geometry_radius_threshold", type=float, default=0.8)
     parser.add_argument("--geometry_radius_graph_r", type=float, default=0.0)
     parser.add_argument("--graph_min_branch_candidates", type=int, default=16)
+    parser.add_argument("--graph_contract_edge_length", type=float, default=0.08)
+    parser.add_argument("--graph_simplify_angle", type=float, default=18.0)
+    parser.add_argument("--graph_simplify_max_segment", type=float, default=0.5)
+    parser.add_argument("--graph_reparent_back_angle", type=float, default=25.0)
+    parser.add_argument("--graph_reparent_hairpin_angle", type=float, default=60.0)
+    parser.add_argument("--graph_reparent_max_passes", type=int, default=16)
+    parser.add_argument("--graph_reparent_root_axis", type=int, default=2)
     parser.add_argument('--gpu', type=int, default=0, help='Index of GPU device to use.')
     parser.add_argument("--reg_mask", action="store_true", default=False)
     parser.add_argument("--reg_align", action="store_true", default=False)
