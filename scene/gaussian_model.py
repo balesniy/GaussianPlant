@@ -1064,7 +1064,7 @@ class GaussianModel:
             leaf_disk = None
 
         self.appgs = self.build_appgs_from_stprs(mesh_cylinder,branch_scales,branch_quat, branch_feature_dc,branch_feature_rest,
-                                                 leaf_disk,leaf_scales, leaf_quat, leaf_feature_dc, leaf_feature_rest,
+                                                 leaf_disk,leaf_scales, leaf_rotations, leaf_feature_dc, leaf_feature_rest,
                                                  branch_label=branch_index, leaf_label=leaf_index,
                                                  samples_per_branch=stpr_appgs_per_stpr, samples_per_leaf=stpr_appgs_per_stpr,
                                                  semantic_dim=stpr_semantic_dim,
@@ -1124,6 +1124,7 @@ class GaussianModel:
         stpr_opacities = self.inverse_opacity_activation( 0.5* torch.ones((stpr_positions.shape[0], 1),device=self.device))
         # Initialize a new GaussianModel for StPrs and return it
         self.structure_gs = GaussianModel(sh_degree=self.max_sh_degree, optimizer_type=self.optimizer_type, device=self.device)
+        self.structure_gs.spatial_lr_scale = self.spatial_lr_scale
         self.structure_gs._xyz = nn.Parameter(stpr_positions.requires_grad_(True))
         self.structure_gs._scaling = nn.Parameter(stpr_scales.requires_grad_(True))
         self.structure_gs._rotation = nn.Parameter(stpr_rotations.requires_grad_(True))
@@ -1191,7 +1192,7 @@ class GaussianModel:
                 quat_np = np.asarray(branch_rotations[i], dtype=np.float32)
                 rot_matrix = torch.tensor(R.from_quat(np.roll(quat_np, -1)).as_matrix(), dtype=torch.float32)
                 pos = local @ rot_matrix.T + torch.tensor(center, dtype=torch.float32).view(1, 3)
-                scale = torch.tensor((scale_np / max(samples_per_branch, 1))).unsqueeze(0).repeat(pos.shape[0], 1)
+                scale = torch.tensor((scale_np / np.sqrt(max(samples_per_branch, 1))), dtype=torch.float32).unsqueeze(0).repeat(pos.shape[0], 1)
                 rot = torch.tensor(quat_np).unsqueeze(0).repeat(pos.shape[0], 1)
                 feature_dc = torch.tensor(branch_feature_dc[i]).repeat(pos.shape[0], 1)
                 feature_rest = torch.tensor(branch_feature_rest[i]).repeat(pos.shape[0], 1)
@@ -1220,9 +1221,14 @@ class GaussianModel:
                     dim=1,
                 )
                 quat_np = np.asarray(leaf_rotations[i], dtype=np.float32)
-                rot_matrix = torch.tensor(R.from_quat(np.roll(quat_np, -1)).as_matrix(), dtype=torch.float32)
+                if quat_np.shape == (3, 3):
+                    rot_matrix_np = quat_np
+                    quat_np = np.roll(R.from_matrix(rot_matrix_np).as_quat(), 1).astype(np.float32)
+                else:
+                    rot_matrix_np = R.from_quat(np.roll(quat_np, -1)).as_matrix()
+                rot_matrix = torch.tensor(rot_matrix_np, dtype=torch.float32)
                 pos = local @ rot_matrix.T + torch.tensor(center, dtype=torch.float32).view(1, 3)
-                scale = torch.tensor(scale_np / max(samples_per_leaf, 1)).unsqueeze(0).repeat(pos.shape[0], 1)
+                scale = torch.tensor(scale_np / np.sqrt(max(samples_per_leaf, 1)), dtype=torch.float32).unsqueeze(0).repeat(pos.shape[0], 1)
                 scale[:,2] = 1e-6
                 rot = torch.tensor(quat_np).unsqueeze(0).repeat(pos.shape[0], 1)
                 feature_dc = torch.tensor(leaf_feature_dc[i]).repeat(pos.shape[0], 1)
@@ -1245,6 +1251,7 @@ class GaussianModel:
         appgs_features_dc = appgs_features_dc.reshape(-1, 1, 3)
         appgs_features_rest = appgs_features_rest.reshape(-1,15,3)
         self.appgs = GaussianModel(sh_degree=self.max_sh_degree, optimizer_type=self.optimizer_type, device=self.device)
+        self.appgs.spatial_lr_scale = self.spatial_lr_scale
         self.appgs._xyz = nn.Parameter(torch.vstack(positions).to(self.device).requires_grad_(True))
         self.appgs._scaling = nn.Parameter(torch.log(torch.vstack((scales))).float().to(self.device).requires_grad_(True))
         self.appgs._rotation = nn.Parameter(torch.vstack(rotations).float().to(self.device).requires_grad_(True))
@@ -1340,6 +1347,7 @@ class GaussianModel:
         new_opacities = self.inverse_opacity_activation(0.1 * torch.ones((sampled_points.shape[0], 1), dtype=torch.float, device=self.device))
         # new_opacities = torch.ones((sampled_points.shape[0], 1), dtype=torch.float, device=self.device)
         self.appgs = GaussianModel(sh_degree=self.max_sh_degree, optimizer_type=self.optimizer_type, device=self.device)
+        self.appgs.spatial_lr_scale = self.spatial_lr_scale
         self.appgs._xyz = nn.Parameter(sampled_points.requires_grad_(True))
         self.appgs._scaling = nn.Parameter(scales.requires_grad_(True))
         self.appgs._rotation = nn.Parameter(rots.requires_grad_(True))

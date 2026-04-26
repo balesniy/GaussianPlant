@@ -232,6 +232,23 @@ def load_feature_map(path, device, layout="auto"):
         return fmap.float().to(device)
     return fmap.permute(2, 0, 1).contiguous().float().to(device)
 
+def maybe_normalize_features(features, mode):
+    if mode == "none":
+        return features
+    if mode == "l2":
+        return F.normalize(features, dim=0)
+    if mode == "channel_standardize":
+        flat = features.flatten(1)
+        mean = flat.mean(dim=1, keepdim=True).view(-1, 1, 1)
+        std = flat.std(dim=1, keepdim=True).clamp(min=1e-6).view(-1, 1, 1)
+        return (features - mean) / std
+    if mode == "channel_standardize_l2":
+        flat = features.flatten(1)
+        mean = flat.mean(dim=1, keepdim=True).view(-1, 1, 1)
+        std = flat.std(dim=1, keepdim=True).clamp(min=1e-6).view(-1, 1, 1)
+        return F.normalize((features - mean) / std, dim=0)
+    raise ValueError(f"Unknown semantic feature normalization: {mode}")
+
 def aggregate_projected_features(gaussians, cameras, args):
     if args.stpr_cluster_method != "feature_kmeans":
         return None
@@ -301,7 +318,11 @@ def get_view_feature_map(viewpoint_cam, args):
         if fmap_path is None:
             return None
         if fmap_path not in args._feature_map_cache:
-            args._feature_map_cache[fmap_path] = load_feature_map(fmap_path, args.device, args.stpr_feature_layout).clamp(0.0, 1.0)
+            fmap = load_feature_map(fmap_path, args.device, args.stpr_feature_layout)
+            if args.semantic_render_mode == "clamped_l1_01":
+                fmap = fmap.clamp(0.0, 1.0)
+            fmap = maybe_normalize_features(fmap, args.stpr_feature_normalization)
+            args._feature_map_cache[fmap_path] = fmap
         fmap = args._feature_map_cache[fmap_path]
     if args.stpr_semantic_dim > 0 and fmap.shape[0] != args.stpr_semantic_dim:
         dim = min(fmap.shape[0], args.stpr_semantic_dim)
@@ -331,21 +352,68 @@ def semantic_feature_render_loss(viewpoint_cam, gaussians, pipe, args, iteration
     offset = ((iteration // max(args.dino_sem_interval, 1)) * render_dim) % dim
     channel_idx = (torch.arange(render_dim, device=args.device) + offset) % dim
     mask = viewpoint_cam.alpha_mask.to(args.device) if getattr(viewpoint_cam, "has_alpha_mask", False) else None
-    denom = mask.sum().clamp(min=1.0) if mask is not None else torch.tensor(float(target.shape[-1] * target.shape[-2]), device=args.device)
-    sem = torch.sigmoid(gaussians._semantic_feature[:, channel_idx])
+    if args.semantic_render_mode == "raw_feature":
+        alpha = render_alpha_approx(viewpoint_cam, gaussians, pipe, args.device)
+        valid = alpha >= args.semantic_alpha_threshold
+        if mask is not None:
+            valid = valid & (mask.unsqueeze(0) > 0.5)
+        denom = valid.sum().clamp(min=1.0)
+        sem = gaussians._semantic_feature[:, channel_idx]
+        clamp_render = False
+    else:
+        valid = mask.unsqueeze(0) > 0.5 if mask is not None else None
+        denom = mask.sum().clamp(min=1.0) if mask is not None else torch.tensor(float(target.shape[-1] * target.shape[-2]), device=args.device)
+        sem = torch.sigmoid(gaussians._semantic_feature[:, channel_idx])
+        clamp_render = True
     target = target[channel_idx]
+    rendered_chunks = []
     losses = []
     for start in range(0, render_dim, 3):
         end = min(start + 3, render_dim)
         colors = torch.zeros((sem.shape[0], 3), dtype=sem.dtype, device=args.device)
         colors[:, :end - start] = sem[:, start:end]
-        rendered = render(viewpoint_cam, gaussians, pipe, torch.zeros((3), dtype=torch.float32, device=args.device), override_color=colors, separate_sh=False)["render"][:end - start]
-        tgt = target[start:end]
-        if mask is not None:
-            losses.append((torch.abs(rendered - tgt) * mask).sum() / (denom * (end - start)))
+        rendered = render(
+            viewpoint_cam,
+            gaussians,
+            pipe,
+            torch.zeros((3), dtype=torch.float32, device=args.device),
+            override_color=colors,
+            separate_sh=False,
+            clamp_render=clamp_render,
+        )["render"][:end - start]
+        if args.semantic_render_mode == "raw_feature":
+            rendered_chunks.append(rendered)
         else:
-            losses.append(torch.abs(rendered - tgt).mean())
-    return torch.stack(losses).mean()
+            tgt = target[start:end]
+            if valid is not None:
+                losses.append((torch.abs(rendered - tgt) * valid).sum() / (denom * (end - start)))
+            else:
+                losses.append(torch.abs(rendered - tgt).mean())
+    if args.semantic_render_mode != "raw_feature":
+        return torch.stack(losses).mean()
+
+    rendered = torch.cat(rendered_chunks, dim=0)
+    if valid is not None:
+        valid_flat = valid.squeeze(0)
+        if valid_flat.any():
+            valid_channels = valid.expand(render_dim, -1, -1)
+            smooth = F.smooth_l1_loss(rendered[valid_channels], target[valid_channels], reduction="mean")
+            cos = 1.0 - F.cosine_similarity(
+                F.normalize(rendered.permute(1, 2, 0)[valid_flat], dim=-1),
+                F.normalize(target.permute(1, 2, 0)[valid_flat], dim=-1),
+                dim=-1,
+            ).mean()
+        else:
+            smooth = rendered.sum() * 0.0
+            cos = rendered.sum() * 0.0
+    else:
+        smooth = F.smooth_l1_loss(rendered, target)
+        cos = 1.0 - F.cosine_similarity(
+            F.normalize(rendered.permute(1, 2, 0).reshape(-1, render_dim), dim=-1),
+            F.normalize(target.permute(1, 2, 0).reshape(-1, render_dim), dim=-1),
+            dim=-1,
+        ).mean()
+    return args.semantic_l1_weight * smooth + args.semantic_cos_weight * cos
 
 def load_semantic_prototype(path, args):
     if not path:
@@ -381,7 +449,7 @@ def stpr_semantic_prototype_loss(gaussians_root, args):
         parent = torch.stack(gaussians_root.nn_stpr_appgs, dim=0).to(args.device).view(-1)
     else:
         parent = gaussians_root.nn_stpr_appgs.to(args.device).view(-1)
-    app_sem = torch.sigmoid(app_feat[:, :dim])
+    app_sem = app_feat[:, :dim] if args.semantic_render_mode == "raw_feature" else torch.sigmoid(app_feat[:, :dim])
     st_feat = torch.zeros((stprs.get_xyz.shape[0], dim), dtype=app_sem.dtype, device=args.device)
     counts = torch.zeros((stprs.get_xyz.shape[0], 1), dtype=app_sem.dtype, device=args.device)
     st_feat.index_add_(0, parent, app_sem)
@@ -916,7 +984,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 elif process_state == "stprs":
                     stprs.max_radii2D[visibility_filter] = torch.max(stprs.max_radii2D[visibility_filter], radii[visibility_filter])
                     stprs.add_densification_stats(viewspace_point_tensor, visibility_filter)
-                    if args.stage_c_enable_densification and iteration > opt.densify_from_iter and iteration % opt.densification_interval:
+                    if args.stage_c_enable_densification and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                         if stprs._xyz.shape[0]<=args.max_stpr_num:
                             size_threshold = 30 if iteration > opt.opacity_reset_interval else None # size_threshold:20
                             stprs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, flag='stpr', size_threshold_small=None)
@@ -1101,6 +1169,11 @@ if __name__ == "__main__":
     parser.add_argument("--stpr_feature_mask_threshold", type=float, default=0.5)
     parser.add_argument("--stpr_semantic_dim", type=int, default=0)
     parser.add_argument("--stpr_semantic_render_dim", type=int, default=12)
+    parser.add_argument("--semantic_render_mode", choices=["clamped_l1_01", "raw_feature"], default="clamped_l1_01")
+    parser.add_argument("--stpr_feature_normalization", choices=["none", "l2", "channel_standardize", "channel_standardize_l2"], default="none")
+    parser.add_argument("--semantic_alpha_threshold", type=float, default=0.01)
+    parser.add_argument("--semantic_l1_weight", type=float, default=1.0)
+    parser.add_argument("--semantic_cos_weight", type=float, default=0.1)
     parser.add_argument("--dino_sem_interval", type=int, default=1)
     parser.add_argument("--lambda_dino_sem", type=float, default=0.0)
     parser.add_argument("--lambda_stpr_sem_proto", type=float, default=0.0)

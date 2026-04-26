@@ -493,7 +493,9 @@ def estimate_gs_para_from_cluster(xyz,test_flag=False):
     rot_matrix_cylinder = z_axis_to_vector_rotation(major_axis,target='cylinder') 
     rot_matrix_gs = z_axis_to_vector_rotation(major_axis, target='gs')
     # rot_matrix_disk = z_axis_to_vector_rotation(normal, target='cylinder')
-    rot_matrix_disk = eigvecs
+    rot_matrix_disk = eigvecs.copy()
+    if np.linalg.det(rot_matrix_disk) < 0:
+        rot_matrix_disk[:, 2] *= -1.0
     rot_gs = R.from_matrix(rot_matrix_gs).as_quat()
     rot_gs = np.roll(rot_gs, 1)  # [x,y,z,w] - > [w,x,y,z]
 
@@ -690,7 +692,7 @@ def is_leaf(points, flatness_thresh=0.1, anisotropy_thresh=0.95): # 0.1, 0.8
     anisotropy = (eigvals[0] - eigvals[1]) / (eigvals[0] + 1e-6)
     # print(f"Anisotropy: {anisotropy}, Flatness: {flatness}")
     
-    if anisotropy < anisotropy_thresh : # and flatness < flatness_thresh
+    if flatness < flatness_thresh and anisotropy < anisotropy_thresh:
         return True # leaf-like
     return False    # branch-like
 
@@ -721,14 +723,14 @@ def align_Z_to_u(u: torch.Tensor) -> torch.Tensor:
 def stpr_to_cylinder(p, S, R,save_flag=True,resolution=32):
     rot_matrix = quaternion_to_matrix(R)  # (N,3,3)
     r = S[:,1]   # (N,)
-    h = 3* S[:, 0]                        # 半长 (从中心到端盖)
-    u_save = rot_matrix[:, :, 2]                     # 轴向单位向量 (N,3)
+    h = 1.5 * S[:, 0]                     # half-length from center to cap
+    u_save = rot_matrix[:, :, 0]          # StPr quaternions align local X to the PCA major axis
 
     if save_flag:
         mesh_all = o3d.geometry.TriangleMesh()
         for i in range(p.shape[0]):
             mesh = o3d.geometry.TriangleMesh.create_cylinder(
-                radius=float(r[i].detach()), height=float(h[i].detach()),
+                radius=float(r[i].detach()), height=float((2.0 * h[i]).detach()),
                 resolution=resolution, split=20)
             u = rot_matrix[i,:,0]                            # 目标主轴
             R_align = align_Z_to_u(u)

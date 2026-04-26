@@ -105,6 +105,23 @@ def transform_feature(feature, pca, out_dim):
     return transformed.reshape(feature.shape[0], feature.shape[1], out_dim).astype(np.float32)
 
 
+def normalize_feature(feature, mode, stats):
+    if mode == "pca":
+        return feature.astype(np.float32)
+    if mode == "minmax_01":
+        return np.clip((feature - stats["low"]) / stats["scale"], 0.0, 1.0).astype(np.float32)
+    if mode == "standardize":
+        return ((feature - stats["mean"]) / stats["std"]).astype(np.float32)
+    if mode == "l2":
+        denom = np.linalg.norm(feature, axis=-1, keepdims=True)
+        return (feature / np.maximum(denom, 1e-6)).astype(np.float32)
+    if mode == "standardize_l2":
+        standardized = (feature - stats["mean"]) / stats["std"]
+        denom = np.linalg.norm(standardized, axis=-1, keepdims=True)
+        return (standardized / np.maximum(denom, 1e-6)).astype(np.float32)
+    raise ValueError(f"Unknown output normalization mode: {mode}")
+
+
 def save_feature(path, feature_hwc, fmt):
     path.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "npy":
@@ -114,7 +131,7 @@ def save_feature(path, feature_hwc, fmt):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fit PCA on object-mask DINO pixels and export normalized PCA feature maps.")
+    parser = argparse.ArgumentParser(description="Fit PCA on object-mask DINO pixels and export PCA feature maps.")
     parser.add_argument("--feature_dir", required=True, help="Directory with raw DINO feature maps (.pt/.pth/.npy/.npz).")
     parser.add_argument("--mask_dir", required=True, help="Directory with object masks named like the source images/features.")
     parser.add_argument("--output_dir", required=True, help="Directory for PCA-compressed feature maps.")
@@ -123,7 +140,16 @@ def main():
     parser.add_argument("--mask_threshold", type=float, default=0.5)
     parser.add_argument("--max_samples_per_view", type=int, default=4096)
     parser.add_argument("--max_total_samples", type=int, default=300000)
-    parser.add_argument("--normalization_percentile", type=float, default=1.0, help="Use p and 100-p percentiles on object pixels. Set 0 for min/max.")
+    parser.add_argument(
+        "--output_normalization",
+        choices=["minmax_01", "pca", "standardize", "l2", "standardize_l2"],
+        default="minmax_01",
+        help=(
+            "Feature-space normalization to write. minmax_01 is the legacy clamped debug format; "
+            "standardize_l2 is usually the better faithful semantic-render target."
+        ),
+    )
+    parser.add_argument("--normalization_percentile", type=float, default=1.0, help="For minmax_01, use p and 100-p percentiles on object pixels. Set 0 for min/max.")
     parser.add_argument("--background", choices=["zero", "neutral"], default="neutral")
     parser.add_argument("--save_format", choices=["pt", "npy"], default="pt")
     parser.add_argument("--whiten", action="store_true", default=False)
@@ -164,7 +190,7 @@ def main():
     pca = PCA(n_components=out_dim, whiten=args.whiten, svd_solver="randomized", random_state=args.seed)
     pca.fit(samples)
 
-    object_transformed_samples = pca.transform(samples)[:, :out_dim]
+    object_transformed_samples = pca.transform(samples)[:, :out_dim].astype(np.float32)
     if args.normalization_percentile > 0:
         low = np.percentile(object_transformed_samples, args.normalization_percentile, axis=0)
         high = np.percentile(object_transformed_samples, 100.0 - args.normalization_percentile, axis=0)
@@ -173,8 +199,13 @@ def main():
         high = object_transformed_samples.max(axis=0)
     scale = np.maximum(high - low, 1e-6).astype(np.float32)
     low = low.astype(np.float32)
+    mean = object_transformed_samples.mean(axis=0).astype(np.float32)
+    std = np.maximum(object_transformed_samples.std(axis=0), 1e-6).astype(np.float32)
+    stats = {"low": low, "scale": scale, "mean": mean, "std": std}
 
     bg_value = 0.0 if args.background == "zero" else 0.5
+    if args.output_normalization != "minmax_01" and args.background == "neutral":
+        print("[WARN] neutral background is only geometry-neutral for minmax_01; consider --background zero for raw/standardized features")
     written = 0
     for feature_path in feature_files:
         feature = load_feature(feature_path, args.feature_layout)
@@ -184,7 +215,7 @@ def main():
             continue
         mask = load_mask(mask_path, feature.shape[:2], args.mask_threshold)
         transformed = transform_feature(feature, pca, out_dim)
-        transformed = np.clip((transformed - low) / scale, 0.0, 1.0)
+        transformed = normalize_feature(transformed, args.output_normalization, stats)
         transformed[~mask] = bg_value
         save_feature(Path(args.output_dir) / feature_path.stem, transformed, args.save_format)
         written += 1
@@ -195,6 +226,7 @@ def main():
         "mask_dir": str(args.mask_dir),
         "feature_layout": args.feature_layout,
         "mask_threshold": args.mask_threshold,
+        "output_normalization": args.output_normalization,
         "normalization_percentile": args.normalization_percentile,
         "background": args.background,
         "whiten": args.whiten,
@@ -203,6 +235,15 @@ def main():
         "explained_variance_ratio": pca.explained_variance_ratio_.astype(float).tolist(),
         "normalization_low": low.astype(float).tolist(),
         "normalization_scale": scale.astype(float).tolist(),
+        "standardization_mean": mean.astype(float).tolist(),
+        "standardization_std": std.astype(float).tolist(),
+        "feature_space": {
+            "source": "dino",
+            "projection": "pca",
+            "dim": out_dim,
+            "normalization": args.output_normalization,
+            "notes": "Use semantic_render_mode=raw_feature for non-minmax feature losses.",
+        },
     }
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     with open(Path(args.output_dir) / "object_only_pca_meta.json", "w") as f:
