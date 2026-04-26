@@ -729,7 +729,7 @@ class GaussianModel:
 
     def build_stprs_from_gs(self, num_clusters=100,method: Literal['coarse_kmeans', 'kmeans', 'random', '3dgs', 'feature_kmeans'] = 'coarse_kmeans', min_cluster_points=100,
                             point_features=None, stpr_feature_weight=1.0, stpr_xyz_weight=0.25, stpr_appgs_per_stpr=50,
-                            stpr_semantic_dim=0,
+                            stpr_semantic_dim=0, stpr_appgs_max_scale_ratio=0.03,
                             scene_extent=None, stpr_min_scale_ratio=1e-5, stpr_max_scale_ratio=0.5,
                             debug_dir=None, plant_prior="mixed", no_leaf_mode=False,
                             stpr_dbscan_eps=0.005, stpr_dbscan_min_samples=5,
@@ -1068,6 +1068,8 @@ class GaussianModel:
                                                  branch_label=branch_index, leaf_label=leaf_index,
                                                  samples_per_branch=stpr_appgs_per_stpr, samples_per_leaf=stpr_appgs_per_stpr,
                                                  semantic_dim=stpr_semantic_dim,
+                                                 branch_positions=branch_positions, leaf_positions=leaf_positions,
+                                                 scene_extent=scene_extent, max_scale_ratio=stpr_appgs_max_scale_ratio,
                                                  )
         self.leaf_disks = leaf_disk
         self.branch_cylinders = mesh_cylinder
@@ -1155,7 +1157,8 @@ class GaussianModel:
     def build_appgs_from_stprs(self, mesh_cylinder,branch_scales,branch_rotations, branch_feature_dc, branch_feature_rest,
                                leaf_disk,leaf_scales, leaf_rotations,leaf_feature_dc, leaf_feature_rest,
                                branch_label, leaf_label,
-                               samples_per_branch=10, samples_per_leaf=10, semantic_dim=0):
+                               samples_per_branch=10, samples_per_leaf=10, semantic_dim=0,
+                               branch_positions=None, leaf_positions=None, scene_extent=None, max_scale_ratio=0.03):
         """
         Build Appearance Gaussians (AppGs) from the structural primitives (StPrs).
         """
@@ -1166,13 +1169,27 @@ class GaussianModel:
         new_features_rest = []
         app_label = []
         app_stpr_nn = []
-        if mesh_cylinder is not None:
-            for i,cylinder in enumerate(mesh_cylinder):
-                branch_pcd = cylinder.sample_points_uniformly(samples_per_branch)
-                pos = torch.tensor(np.asarray(branch_pcd.points)).float()
-                scale = torch.tensor((branch_scales[i]/samples_per_branch)).unsqueeze(0).repeat(pos.shape[0], 1)
-                # rot_quat = matrix_to_quaternion(branch_rotations[i])
-                rot = torch.tensor(branch_rotations[i]).unsqueeze(0).repeat(pos.shape[0], 1)
+        max_scale = None
+        if scene_extent is not None and max_scale_ratio > 0:
+            max_scale = float(scene_extent) * float(max_scale_ratio)
+
+        if branch_positions is not None and len(branch_positions) > 0:
+            for i, center in enumerate(branch_positions):
+                scale_np = np.asarray(branch_scales[i], dtype=np.float32).copy()
+                if max_scale is not None:
+                    scale_np = np.clip(scale_np, 1e-6, max_scale)
+                theta = torch.rand((samples_per_branch,), dtype=torch.float32) * (2.0 * torch.pi)
+                axial = (torch.rand((samples_per_branch,), dtype=torch.float32) - 0.5) * (3.0 * float(scale_np[0]))
+                radius = float(scale_np[1])
+                local = torch.stack(
+                    [axial, radius * torch.cos(theta), radius * torch.sin(theta)],
+                    dim=1,
+                )
+                quat_np = np.asarray(branch_rotations[i], dtype=np.float32)
+                rot_matrix = torch.tensor(R.from_quat(np.roll(quat_np, -1)).as_matrix(), dtype=torch.float32)
+                pos = local @ rot_matrix.T + torch.tensor(center, dtype=torch.float32).view(1, 3)
+                scale = torch.tensor((scale_np / max(samples_per_branch, 1))).unsqueeze(0).repeat(pos.shape[0], 1)
+                rot = torch.tensor(quat_np).unsqueeze(0).repeat(pos.shape[0], 1)
                 feature_dc = torch.tensor(branch_feature_dc[i]).repeat(pos.shape[0], 1)
                 feature_rest = torch.tensor(branch_feature_rest[i]).repeat(pos.shape[0], 1)
                 positions.append(pos)
@@ -1186,14 +1203,25 @@ class GaussianModel:
                 app_stpr_nn.extend(app_index)
 
 
-        if leaf_disk is not None:
-            for i,disk in enumerate(leaf_disk):
-                leaf_pcd = disk.sample_points_uniformly(samples_per_leaf)
-                pos = torch.tensor(np.asarray(leaf_pcd.points)).float()
-                scale = torch.tensor(leaf_scales[i]/samples_per_leaf).unsqueeze(0).repeat(pos.shape[0], 1)
+        if leaf_positions is not None and len(leaf_positions) > 0:
+            for i, center in enumerate(leaf_positions):
+                scale_np = np.asarray(leaf_scales[i], dtype=np.float32).copy()
+                if max_scale is not None:
+                    scale_np = np.clip(scale_np, 1e-6, max_scale)
+                theta = torch.rand((samples_per_leaf,), dtype=torch.float32) * (2.0 * torch.pi)
+                radius = torch.sqrt(torch.rand((samples_per_leaf,), dtype=torch.float32))
+                local = torch.stack(
+                    [2.0 * float(scale_np[0]) * radius * torch.cos(theta),
+                     float(scale_np[1]) * radius * torch.sin(theta),
+                     torch.zeros_like(theta)],
+                    dim=1,
+                )
+                quat_np = np.asarray(leaf_rotations[i], dtype=np.float32)
+                rot_matrix = torch.tensor(R.from_quat(np.roll(quat_np, -1)).as_matrix(), dtype=torch.float32)
+                pos = local @ rot_matrix.T + torch.tensor(center, dtype=torch.float32).view(1, 3)
+                scale = torch.tensor(scale_np / max(samples_per_leaf, 1)).unsqueeze(0).repeat(pos.shape[0], 1)
                 scale[:,2] = 1e-6
-                # rot_quat = matrix_to_quaternion(leaf_rotations[i])
-                rot = torch.tensor(leaf_rotations[i]).unsqueeze(0).repeat(pos.shape[0], 1)
+                rot = torch.tensor(quat_np).unsqueeze(0).repeat(pos.shape[0], 1)
                 feature_dc = torch.tensor(leaf_feature_dc[i]).repeat(pos.shape[0], 1)
                 feature_rest = torch.tensor(leaf_feature_rest[i]).repeat(pos.shape[0], 1)
                 positions.append(pos)

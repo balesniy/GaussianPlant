@@ -540,6 +540,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     stpr_feature_weight=args.stpr_feature_weight,
                     stpr_xyz_weight=args.stpr_xyz_weight,
                     stpr_appgs_per_stpr=args.stpr_appgs_per_stpr,
+                    stpr_appgs_max_scale_ratio=args.stpr_appgs_max_scale_ratio,
                     stpr_semantic_dim=args.stpr_semantic_dim,
                     scene_extent=scene.cameras_extent,
                     stpr_min_scale_ratio=args.stpr_min_scale_ratio,
@@ -1059,6 +1060,7 @@ if __name__ == "__main__":
     parser.add_argument("--min_cluster_points", type=int, default=100)
     parser.add_argument("--stpr_cluster_method", choices=["coarse_kmeans", "3dgs", "feature_kmeans"], default="coarse_kmeans")
     parser.add_argument("--stpr_appgs_per_stpr", type=int, default=50)
+    parser.add_argument("--stpr_appgs_max_scale_ratio", type=float, default=0.03)
     parser.add_argument("--stpr_dbscan_eps", type=float, default=0.0)
     parser.add_argument("--stpr_dbscan_min_samples", type=int, default=5)
     parser.add_argument("--stpr_feature_source", choices=["precomputed", "image_rgb"], default="precomputed")
