@@ -1207,7 +1207,7 @@ def refine_fruit_tree_graph(points, edges, root_axis=2, trunk_height_weight=1.0,
     trunk_nodes = set()
     for root in roots:
         component_nodes = np.flatnonzero(root_of == root)
-        if not component_nodes:
+        if len(component_nodes) == 0:
             continue
         root_height = float(points[root, axis])
         scores = []
