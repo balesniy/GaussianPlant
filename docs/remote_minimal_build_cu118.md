@@ -11,6 +11,7 @@ installation, including CUDA 13. The project runs with an isolated conda CUDA
 - PyTorch3D 0.7.4 has a matching conda binary for this stack.
 - `simple-knn` is no longer required because the project has a PyTorch fallback.
 - `fused-ssim` is optional because training already falls back to pure PyTorch SSIM.
+- `faiss-gpu` is optional because KMeans falls back to scikit-learn.
 - `diff_gaussian_rasterization` is still required by the renderer and must match
   PyTorch/CUDA exactly.
 

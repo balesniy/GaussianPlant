@@ -46,7 +46,10 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scipy.spatial.transform import Rotation as R
 from sklearn.cluster import KMeans
-import faiss
+try:
+    import faiss
+except ImportError:
+    faiss = None
 import open3d as o3d
 from pytorch3d.transforms import quaternion_to_matrix, quaternion_invert, quaternion_apply, matrix_to_quaternion
 from pytorch3d.ops import knn_points, estimate_pointcloud_normals
@@ -62,6 +65,18 @@ try:
     from diff_gaussian_rasterization import SparseGaussianAdam
 except:
     pass
+
+def run_kmeans(features, k, niter=25, nredo=3):
+    if faiss is not None:
+        try:
+            kmeans = faiss.Kmeans(d=features.shape[1], k=k, niter=niter, nredo=nredo, gpu=True)
+            kmeans.train(features)
+            return kmeans.index.search(features, 1)[1].flatten()
+        except Exception as exc:
+            print(f"[Warning] faiss GPU KMeans failed, falling back to sklearn KMeans: {exc}")
+
+    kmeans = KMeans(n_clusters=k, n_init=nredo, max_iter=niter, random_state=0)
+    return kmeans.fit_predict(features)
 
 class GaussianModel:
 
@@ -802,9 +817,7 @@ class GaussianModel:
             xyz_scale = scene_extent if scene_extent is not None and scene_extent > 0 else np.linalg.norm(xyz.max(axis=0) - xyz.min(axis=0))
             feature_vectors = ((xyz - xyz_center) / max(float(xyz_scale), 1e-6)).astype(np.float32)
             print(f"[DEBUG][coarse-kmeans] points={xyz.shape[0]} k={k} target_points_per_stpr~{max(xyz.shape[0] // max(k, 1), 1)}")
-            kmeans = faiss.Kmeans(d=feature_vectors.shape[1], k=k, niter=25, nredo=3, gpu=True)
-            kmeans.train(feature_vectors)
-            labels = kmeans.index.search(feature_vectors, 1)[1].flatten()
+            labels = run_kmeans(feature_vectors, k, niter=25, nredo=3)
             point_colors = np.full((xyz.shape[0], 3), 0.7, dtype=np.float32)
             used_points = 0
             skipped_tiny = 0
@@ -891,9 +904,7 @@ class GaussianModel:
                     f"[DEBUG][feature-kmeans] points={xyz.shape[0]} feature_dim={point_features.shape[1]} "
                     f"k={k} xyz_weight={stpr_xyz_weight} feature_weight={stpr_feature_weight}"
                 )
-                kmeans = faiss.Kmeans(d=cluster_features.shape[1], k=k, niter=25, nredo=3, gpu=True)
-                kmeans.train(cluster_features)
-                labels = kmeans.index.search(cluster_features, 1)[1].flatten()
+                labels = run_kmeans(cluster_features, k, niter=25, nredo=3)
 
                 unique_labels = set(labels)
                 label_leaf = []

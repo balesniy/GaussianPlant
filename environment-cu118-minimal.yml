@@ -35,7 +35,6 @@ dependencies:
   - joblib
   - trimesh
   - open3d=0.17.*
-  - faiss-gpu
   - pip:
       - pyquaternion==0.9.9
       - pymcubes==0.1.4
