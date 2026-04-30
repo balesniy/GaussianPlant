@@ -622,9 +622,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     loss_mst = 0
     image_stprs = None
     for iteration in range(first_iter, opt.iterations + 1):
-        if network_gui.conn == None:
+        if not args.disable_viewer and network_gui.conn == None:
             network_gui.try_connect()
-        while network_gui.conn != None:
+        while not args.disable_viewer and network_gui.conn != None:
             try:
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
@@ -1012,10 +1012,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if iteration >100:
                 # appgs.reset_neighbors()
-                refresh_neighbors_if_needed(stprs, iteration, args.neighbor_update_interval)
-                neighbor_idx  = stprs.get_neighbors_of_random_points(-1)
-                refresh_neighbors_if_needed(appgs, iteration, args.neighbor_update_interval)
-                neighbor_idx_app  = appgs.get_neighbors_of_random_points(-1)
+                if args.reg_align or args.reg_overlap:
+                    refresh_neighbors_if_needed(stprs, iteration, args.neighbor_update_interval)
+                    neighbor_idx  = stprs.get_neighbors_of_random_points(-1)
+                if args.reg_align:
+                    refresh_neighbors_if_needed(appgs, iteration, args.neighbor_update_interval)
+                    neighbor_idx_app  = appgs.get_neighbors_of_random_points(-1)
                 # neighbor_idx_appg  = appgs.get_neighbors_of_random_points(stprs.get_xyz.shape[0]//10)
                 if args.reg_align:
                     loss_align = align_loss(appgs, neighbor_idx_app)
@@ -1045,14 +1047,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
-            if iteration % 10 == 0:
+            if iteration % 100 == 0:
                 if appgs is not None:
                     progress_bar.set_postfix({"L1": f"{Ll1.item():.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}",  "Num of appgs":f"{appgs.get_xyz.shape[0]}", "Num of stprs":f"{stprs.get_xyz.shape[0]}","Align Loss": f"{loss_align:.{7}f}", 
                                               "Overlap Loss": f"{loss_overlap:.{7}f}",})
                 else:
                     progress_bar.set_postfix({"L1": f"{Ll1.item():.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}", "Align Loss": f"{loss_align:.{7}f}", 
                                           "Overlap Loss": f"{loss_overlap:.{7}f}"})
-                progress_bar.update(10)
+                progress_bar.update(100)
             if iteration == opt.iterations:
                 progress_bar.close()
 
