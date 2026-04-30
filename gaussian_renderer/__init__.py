@@ -11,7 +11,14 @@
 
 import torch
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+try:
+    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+except ImportError as exc:
+    raise ImportError(
+        "diff_gaussian_rasterization is required by GaussianPlant's renderer. "
+        "For the minimal remote setup, install PyTorch3D from conda and build only "
+        "submodules/diff-gaussian-rasterization with the same nvcc version as torch.version.cuda."
+    ) from exc
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 

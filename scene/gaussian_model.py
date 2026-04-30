@@ -18,7 +18,30 @@ import json
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
-from simple_knn._C import distCUDA2
+try:
+    from simple_knn._C import distCUDA2
+except ImportError:
+    def distCUDA2(points, chunk_size=2048):
+        """PyTorch fallback for environments where simple-knn is not built."""
+        if points.ndim != 2 or points.shape[-1] != 3:
+            raise ValueError(f"Expected points with shape [N, 3], got {tuple(points.shape)}")
+        if points.shape[0] <= 1:
+            return torch.ones((points.shape[0],), dtype=points.dtype, device=points.device)
+
+        points = points.contiguous()
+        num_points = points.shape[0]
+        k = min(3, num_points - 1)
+        mean_dists = torch.empty((num_points,), dtype=points.dtype, device=points.device)
+        chunk_indices = torch.arange(chunk_size, device=points.device)
+
+        for start in range(0, num_points, chunk_size):
+            end = min(start + chunk_size, num_points)
+            dist = torch.cdist(points[start:end], points, p=2).square()
+            row_indices = chunk_indices[: end - start]
+            dist[row_indices, torch.arange(start, end, device=points.device)] = float("inf")
+            mean_dists[start:end] = dist.topk(k, largest=False, dim=1).values.mean(dim=1)
+
+        return mean_dists
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scipy.spatial.transform import Rotation as R

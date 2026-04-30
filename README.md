@@ -38,6 +38,12 @@ or
 git clone https://github.com/Yrainy0615/GaussianPlant.git --recursive
 ```
 
+For a remote machine where PyTorch3D should stay binary-only, use
+[`environment-cu118-minimal.yml`](environment-cu118-minimal.yml) and follow
+[`docs/remote_minimal_build_cu118.md`](docs/remote_minimal_build_cu118.md).
+That path builds only `diff_gaussian_rasterization`; `simple-knn` and
+`fused-ssim` are optional.
+
 ## Overview
 
 The codebase has 4 main components:
@@ -47,7 +53,6 @@ The codebase has 4 main components:
 - A script to help you turn your own images into optimization-ready SfM data sets
 
 The components have different requirements w.r.t. both hardware and software. They have been tested on Windows 10 and Ubuntu Linux 24.04. Instructions for setting up and running each of them are found in the sections below.
-
 
 
 
