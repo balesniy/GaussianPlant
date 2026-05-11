@@ -10,6 +10,7 @@
 #
 from typing import Literal
 import torch
+import torch.nn.functional as F
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
@@ -65,6 +66,73 @@ try:
     from diff_gaussian_rasterization import SparseGaussianAdam
 except:
     pass
+
+
+def _minimum_spanning_forest(num_nodes, edges, costs, max_edge_length=0.0, edge_lengths=None, max_edge_cost=0.0):
+    if num_nodes <= 1 or len(edges) == 0:
+        return np.empty((0, 2), dtype=np.int64)
+
+    order = np.argsort(np.asarray(costs, dtype=np.float64))
+    parent = np.arange(num_nodes, dtype=np.int64)
+    rank = np.zeros(num_nodes, dtype=np.int8)
+    selected = []
+
+    def find(x):
+        x = int(x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = int(parent[x])
+        return x
+
+    def union(a, b):
+        ra = find(a)
+        rb = find(b)
+        if ra == rb:
+            return False
+        if rank[ra] < rank[rb]:
+            ra, rb = rb, ra
+        parent[rb] = ra
+        if rank[ra] == rank[rb]:
+            rank[ra] += 1
+        return True
+
+    for edge_idx in order:
+        if max_edge_cost > 0 and costs[edge_idx] > max_edge_cost:
+            continue
+        if max_edge_length > 0 and edge_lengths is not None and edge_lengths[edge_idx] > max_edge_length:
+            continue
+        a, b = edges[edge_idx]
+        if union(a, b):
+            selected.append((int(a), int(b)))
+            if max_edge_length <= 0 and len(selected) == num_nodes - 1:
+                break
+    return np.asarray(selected, dtype=np.int64)
+
+
+def _orient_tree_edges(num_nodes, undirected_edges, root):
+    if num_nodes <= 1 or len(undirected_edges) == 0:
+        return np.empty((0, 2), dtype=np.int64), np.zeros((num_nodes,), dtype=np.int64)
+    adjacency = [[] for _ in range(num_nodes)]
+    for a, b in undirected_edges:
+        adjacency[int(a)].append(int(b))
+        adjacency[int(b)].append(int(a))
+
+    parent = np.full((num_nodes,), -1, dtype=np.int64)
+    oriented = []
+    roots = [int(root)] + [idx for idx in range(num_nodes) if idx != int(root)]
+    for component_root in roots:
+        if parent[component_root] != -1:
+            continue
+        parent[component_root] = component_root
+        queue = [component_root]
+        for node in queue:
+            for nbr in adjacency[node]:
+                if parent[nbr] != -1:
+                    continue
+                parent[nbr] = node
+                oriented.append((node, nbr))
+                queue.append(nbr)
+    return np.asarray(oriented, dtype=np.int64), parent
 
 def run_kmeans(features, k, niter=25, nredo=3):
     if faiss is not None:
@@ -2033,3 +2101,219 @@ class GaussianModel:
         # graph loss 
         loss_graph = mst_loss(top,bottom,rot_matrix,mst_edges) 
         return mst_edges, points,loss_graph
+
+    def tree_constrained_stpr_loss(
+            self,
+            min_branch_candidates=16,
+            knn=12,
+            constraint_mode="sfs_invariants",
+            projection="forest",
+            root_axis=2,
+            forest_max_edge_length=0.0,
+            forest_max_edge_cost=0.0,
+            distance_weight=1.0,
+            angle_weight=0.25,
+            radius_cost_weight=0.25,
+            branch_weight=0.5,
+            sfs_weight=1.0,
+            radius_weight=0.25,
+            angle_loss_weight=0.25,
+            degree_weight=0.02,
+            max_degree=4,
+            radius_margin=0.0,
+            branch_label_weight=0.05,
+            branch_label_target=0.8,
+            branch_label_min_prob=0.25,
+            neg_per_pos=3,
+            anisotropy_threshold=1.0):
+        if self.structure_gs is None or self.structure_gs.get_xyz.shape[0] < 2:
+            device = self.device if self.device is not None else self.get_xyz.device
+            return torch.tensor(0.0, device=device)
+
+        stprs = self.structure_gs
+        device = stprs.get_xyz.device
+        if stprs._pst_logit is not None:
+            p_branch = torch.sigmoid(stprs._pst_logit).view(-1)
+            branch_mask = p_branch > 0.5
+        elif stprs.stpr_label is None:
+            p_branch = None
+            branch_mask = torch.ones((stprs.get_xyz.shape[0],), dtype=torch.bool, device=device)
+        else:
+            p_branch = None
+            branch_mask = torch.tensor([lbl == "branch" for lbl in stprs.stpr_label], dtype=torch.bool, device=device)
+
+        scales_all = stprs.get_scaling
+        anisotropy = scales_all[:, 0] / scales_all[:, 1].clamp(min=1e-8)
+        anisotropy = torch.maximum(anisotropy, 1.0 / anisotropy.clamp(min=1e-8)).flatten()
+        keep = (anisotropy > anisotropy_threshold) & branch_mask
+        if int(keep.sum().item()) < min_branch_candidates:
+            pool = torch.nonzero(anisotropy > anisotropy_threshold, as_tuple=False).view(-1)
+            if pool.numel() == 0:
+                pool = torch.arange(stprs.get_xyz.shape[0], device=device)
+            if p_branch is not None:
+                aniso_score = torch.log(anisotropy.clamp(min=1.0))
+                aniso_score = aniso_score / aniso_score.max().clamp(min=1e-6)
+                score = p_branch + 0.25 * aniso_score
+            else:
+                score = anisotropy
+            k = min(max(min_branch_candidates, int(branch_mask.sum().item())), pool.numel())
+            selected = pool[torch.topk(score[pool], k=k, largest=True).indices]
+            keep = torch.zeros_like(branch_mask, dtype=torch.bool)
+            keep[selected] = True
+
+        branch_indices = torch.nonzero(keep, as_tuple=False).view(-1)
+        n = int(branch_indices.numel())
+        if n < 2:
+            return stprs.get_xyz.sum() * 0.0
+
+        xyz = stprs.get_xyz[branch_indices]
+        scales = stprs.get_scaling[branch_indices]
+        rot = stprs.get_rotation[branch_indices]
+        rot_matrix = quaternion_to_matrix(rot)
+        axis = F.normalize(rot_matrix[:, :, 0], dim=-1, eps=1e-8)
+        radius = scales[:, 1:].mean(dim=-1)
+        p_branch_kept = torch.sigmoid(stprs._pst_logit[branch_indices]).view(-1) if stprs._pst_logit is not None else torch.ones((n,), device=device)
+
+        query_k = min(max(int(knn), 1) + 1, n)
+        with torch.no_grad():
+            dist_detached = torch.cdist(xyz.detach(), xyz.detach(), p=2)
+            _, nbr = torch.topk(dist_detached, k=query_k, largest=False, dim=1)
+            edge_set = set()
+            for i in range(n):
+                for j in nbr[i, 1:].detach().cpu().tolist():
+                    a, b = sorted((int(i), int(j)))
+                    if a != b:
+                        edge_set.add((a, b))
+            if not edge_set:
+                return xyz.sum() * 0.0
+            edge_np = np.asarray(sorted(edge_set), dtype=np.int64)
+
+        edge_idx = torch.as_tensor(edge_np, dtype=torch.long, device=device)
+        a = edge_idx[:, 0]
+        b = edge_idx[:, 1]
+        delta = xyz[b] - xyz[a]
+        dist = torch.linalg.norm(delta, dim=-1).clamp(min=1e-8)
+        edge_dir = delta / dist[:, None]
+        axis_align = torch.maximum(torch.abs((axis[a] * edge_dir).sum(dim=-1)), torch.abs((axis[b] * edge_dir).sum(dim=-1)))
+        radius_ratio = torch.minimum(radius[a], radius[b]) / torch.maximum(radius[a], radius[b]).clamp(min=1e-8)
+        radius_penalty_cost = 1.0 - radius_ratio
+        branch_conf = torch.minimum(p_branch_kept[a], p_branch_kept[b])
+        cost = (
+            distance_weight * dist
+            + angle_weight * (1.0 - axis_align)
+            + radius_cost_weight * radius_penalty_cost
+            - branch_weight * branch_conf
+        )
+        edge_logits = -cost
+
+        with torch.no_grad():
+            projection = str(projection)
+            use_forest_thresholds = projection == "forest"
+            selected_np = _minimum_spanning_forest(
+                n,
+                edge_np,
+                cost.detach().cpu().numpy(),
+                max_edge_length=float(forest_max_edge_length) if use_forest_thresholds else 0.0,
+                edge_lengths=dist.detach().cpu().numpy(),
+                max_edge_cost=float(forest_max_edge_cost) if use_forest_thresholds else 0.0,
+            )
+            if selected_np.shape[0] == 0:
+                return edge_logits.sum() * 0.0
+            selected_pairs = {tuple(sorted((int(a0), int(b0)))) for a0, b0 in selected_np.tolist()}
+            target_np = np.asarray([1.0 if tuple(edge) in selected_pairs else 0.0 for edge in edge_np], dtype=np.float32)
+            root = int(torch.argmin(xyz[:, int(root_axis)].detach()).item()) if 0 <= int(root_axis) < 3 else 0
+            oriented_np, _ = _orient_tree_edges(n, selected_np, root)
+
+        targets = torch.as_tensor(target_np, dtype=edge_logits.dtype, device=device)
+        selected_mask = targets > 0.5
+        rejected_mask = ~selected_mask
+        pos_logits = edge_logits[selected_mask]
+        pos_loss = F.binary_cross_entropy_with_logits(pos_logits, torch.ones_like(pos_logits)) if pos_logits.numel() else edge_logits.sum() * 0.0
+        if rejected_mask.any() and pos_logits.numel() and neg_per_pos > 0:
+            neg_logits_all = edge_logits[rejected_mask]
+            num_neg = min(int(neg_per_pos) * int(pos_logits.numel()), int(neg_logits_all.numel()))
+            neg_logits = torch.topk(neg_logits_all, k=num_neg, largest=True).values
+            neg_loss = F.binary_cross_entropy_with_logits(neg_logits, torch.zeros_like(neg_logits))
+        else:
+            neg_loss = edge_logits.sum() * 0.0
+
+        with torch.no_grad():
+            selected_edge_indices = np.flatnonzero(target_np > 0.5)
+            edge_lengths_np = dist.detach().cpu().numpy()
+            component_parent = np.arange(n, dtype=np.int64)
+
+            def component_find(x):
+                x = int(x)
+                while component_parent[x] != x:
+                    component_parent[x] = component_parent[component_parent[x]]
+                    x = int(component_parent[x])
+                return x
+
+            for a0, b0 in selected_np:
+                ra = component_find(a0)
+                rb = component_find(b0)
+                if ra != rb:
+                    component_parent[rb] = ra
+            component_count = len({component_find(idx) for idx in range(n)})
+            selected_nodes_np = np.unique(oriented_np.reshape(-1)) if oriented_np.size else np.empty((0,), dtype=np.int64)
+            selected_nodes_t = torch.as_tensor(selected_nodes_np, dtype=torch.long, device=device)
+            self.tree_constraint_stats = {
+                "num_branch_candidates": n,
+                "num_candidate_edges": int(edge_np.shape[0]),
+                "num_projected_edges": int(selected_np.shape[0]),
+                "component_count": int(component_count),
+                "mean_selected_edge_length": float(edge_lengths_np[selected_edge_indices].mean()) if selected_edge_indices.size else 0.0,
+                "mean_hard_negative_logit": float(neg_logits.detach().mean().item()) if "neg_logits" in locals() and neg_logits.numel() else 0.0,
+                "radius_violation_rate": 0.0,
+                "pst_selected_mean": float(p_branch_kept[selected_nodes_t].detach().mean().item()) if selected_nodes_t.numel() else 0.0,
+                "max_degree": 0.0,
+            }
+
+        constraint_mode = str(constraint_mode)
+        if constraint_mode == "mst_only":
+            return sfs_weight * pos_loss
+
+        sfs_loss = pos_loss + neg_loss
+        if constraint_mode == "sfs":
+            return sfs_weight * sfs_loss
+
+        oriented = torch.as_tensor(oriented_np, dtype=torch.long, device=device)
+        parent = oriented[:, 0]
+        child = oriented[:, 1]
+        parent_xyz = xyz[parent]
+        child_xyz = xyz[child]
+        tree_delta = child_xyz - parent_xyz
+        tree_dist = torch.linalg.norm(tree_delta, dim=-1).clamp(min=1e-8)
+        tree_dir = tree_delta / tree_dist[:, None]
+
+        radius_loss = F.relu(radius[child] - radius[parent] + radius_margin).mean()
+        parent_angle = 1.0 - torch.abs((axis[parent] * tree_dir).sum(dim=-1))
+        child_angle = 1.0 - torch.abs((axis[child] * tree_dir).sum(dim=-1))
+        angle_loss = 0.5 * (parent_angle + child_angle).mean()
+        degree = torch.zeros((n,), dtype=edge_logits.dtype, device=device)
+        degree.index_add_(0, parent, torch.ones_like(parent, dtype=edge_logits.dtype))
+        degree.index_add_(0, child, torch.ones_like(child, dtype=edge_logits.dtype))
+        degree_loss = F.relu(degree - float(max_degree)).square().mean()
+        selected_nodes = torch.unique(oriented)
+        branch_gate = p_branch_kept[selected_nodes].detach() >= float(branch_label_min_prob)
+        if stprs._pst_logit is not None and branch_gate.any() and branch_label_weight > 0:
+            selected_logits = stprs._pst_logit[branch_indices[selected_nodes[branch_gate]]].view(-1)
+            branch_targets = torch.full_like(selected_logits, float(branch_label_target))
+            branch_label_loss = F.binary_cross_entropy_with_logits(selected_logits, branch_targets)
+        else:
+            branch_label_loss = edge_logits.sum() * 0.0
+
+        with torch.no_grad():
+            self.tree_constraint_stats.update({
+                "radius_violation_rate": float((radius[child] > radius[parent] + radius_margin).float().mean().item()) if child.numel() else 0.0,
+                "pst_selected_mean": float(p_branch_kept[selected_nodes].detach().mean().item()) if selected_nodes.numel() else self.tree_constraint_stats["pst_selected_mean"],
+                "max_degree": float(degree.detach().max().item()) if degree.numel() else 0.0,
+            })
+
+        return (
+            sfs_weight * sfs_loss
+            + radius_weight * radius_loss
+            + angle_loss_weight * angle_loss
+            + degree_weight * degree_loss
+            + branch_label_weight * branch_label_loss
+        )

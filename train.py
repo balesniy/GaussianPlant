@@ -70,6 +70,68 @@ def ramp_weight(iteration, target_weight, start_iter, end_iter):
     denom = max(end_iter - start_iter, 1)
     return target_weight * float(iteration - start_iter) / float(denom)
 
+def add_tree_constrained_stpr_loss(gaussians, loss, args, iteration, stage):
+    if not args.reg_tree_stpr or iteration % max(args.tree_constraint_interval, 1) != 0:
+        return loss, torch.tensor(0.0, device=args.device)
+
+    warmup_start = args.tree_loss_warmup_start if args.tree_loss_warmup_start >= 0 else args.stage_a_iterations
+    warmup_end = args.tree_loss_warmup_end
+    if warmup_end <= warmup_start:
+        warmup_end = warmup_start + max(warmup_end, 1)
+    weight = ramp_weight(
+        iteration,
+        args.lambda_tree_stpr,
+        warmup_start,
+        warmup_end,
+    )
+    if weight <= 0:
+        return loss, torch.tensor(0.0, device=args.device)
+
+    stage_c_scale = args.tree_stage_c_invariant_scale if stage == "stprs" else 1.0
+    stage_c_degree_scale = args.tree_stage_c_degree_scale if stage == "stprs" else 1.0
+    tree_loss = gaussians.tree_constrained_stpr_loss(
+        min_branch_candidates=args.graph_min_branch_candidates,
+        knn=args.tree_constraint_knn,
+        constraint_mode=args.tree_constraint_mode,
+        projection=args.tree_projection,
+        root_axis=args.tree_root_axis,
+        forest_max_edge_length=args.tree_forest_max_edge_length,
+        forest_max_edge_cost=args.tree_forest_max_edge_cost,
+        distance_weight=args.tree_cost_distance_weight,
+        angle_weight=args.tree_cost_angle_weight,
+        radius_cost_weight=args.tree_cost_radius_weight,
+        branch_weight=args.tree_cost_branch_weight,
+        sfs_weight=args.tree_sfs_weight,
+        radius_weight=args.tree_radius_weight * stage_c_scale,
+        angle_loss_weight=args.tree_angle_weight * stage_c_scale,
+        degree_weight=args.tree_degree_weight * stage_c_degree_scale,
+        max_degree=args.tree_max_degree,
+        radius_margin=args.tree_radius_margin,
+        branch_label_weight=args.tree_branch_label_weight,
+        branch_label_target=args.tree_branch_label_target,
+        branch_label_min_prob=args.tree_branch_label_min_prob,
+        neg_per_pos=args.tree_neg_per_pos,
+    )
+    loss = loss + tree_loss * weight
+
+    if args.tree_debug_interval > 0 and iteration % args.tree_debug_interval == 0:
+        stats = getattr(gaussians, "tree_constraint_stats", None)
+        if stats is not None:
+            print(
+                "[DEBUG][tree-constraint] "
+                f"stage={stage} weight={weight:.4g} "
+                f"branches={stats['num_branch_candidates']} "
+                f"cand_edges={stats['num_candidate_edges']} "
+                f"proj_edges={stats['num_projected_edges']} "
+                f"components={stats['component_count']} "
+                f"mean_sel_len={stats['mean_selected_edge_length']:.4g} "
+                f"hard_neg_logit={stats['mean_hard_negative_logit']:.4g} "
+                f"radius_viol={stats['radius_violation_rate']:.3f} "
+                f"pst_sel={stats['pst_selected_mean']:.3f} "
+                f"max_degree={stats['max_degree']:.1f}"
+            )
+    return loss, tree_loss
+
 def background_alpha_rgb_loss(viewpoint_cam, gaussians, image, bg, pipe, args, opt, iteration):
     lambda_bg_alpha_eff = ramp_weight(
         iteration,
@@ -953,6 +1015,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if args.reg_freq:
                 loss_freq = stprs.low_freq_loss()
                 loss += loss_freq * opt.lambda_freq
+            loss, loss_mst = add_tree_constrained_stpr_loss(gaussians_init, loss, args, iteration, "stprs")
             # binding loss
             if appgs is not None and opt.lambda_bind > 0:
                 loss_bind = gaussians_init.compute_gaussian_binding_loss(method='surface', plant_prior="branch_only" if args.no_leaf_mode else args.plant_prior)
@@ -1030,6 +1093,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss_opacity_app = appgs.opacity_regularizer()
                     loss_opacity_stprs = stprs.opacity_regularizer()
                     loss += loss_opacity_app * opt.lambda_opacity + loss_opacity_stprs * opt.lambda_opacity
+                loss, loss_mst = add_tree_constrained_stpr_loss(gaussians_init, loss, args, iteration, "appgs")
                 if args.reg_mst:
                     _,_,loss_mst = gaussians_init.stpr_to_graph(min_branch_candidates=args.graph_min_branch_candidates)
                     loss += loss_mst * opt.lambda_mst
@@ -1347,6 +1411,32 @@ if __name__ == "__main__":
     parser.add_argument("--tree_prune_min_support", type=int, default=3)
     parser.add_argument("--tree_smooth_iters", type=int, default=5)
     parser.add_argument("--tree_smooth_lambda", type=float, default=0.35)
+    parser.add_argument("--lambda_tree_stpr", "--tree_loss_weight", dest="lambda_tree_stpr", type=float, default=0.2)
+    parser.add_argument("--tree_loss_warmup_start", type=int, default=-1)
+    parser.add_argument("--tree_loss_warmup_end", type=int, default=3000)
+    parser.add_argument("--tree_constraint_interval", "--tree_update_interval", dest="tree_constraint_interval", type=int, default=10)
+    parser.add_argument("--tree_constraint_knn", "--tree_knn_k", dest="tree_constraint_knn", type=int, default=8)
+    parser.add_argument("--tree_constraint_mode", choices=["mst_only", "sfs", "sfs_invariants"], default="sfs_invariants")
+    parser.add_argument("--tree_projection", choices=["mst", "rooted_mst", "forest"], default="forest")
+    parser.add_argument("--tree_forest_max_edge_length", type=float, default=0.0)
+    parser.add_argument("--tree_forest_max_edge_cost", type=float, default=0.0)
+    parser.add_argument("--tree_cost_distance_weight", type=float, default=1.0)
+    parser.add_argument("--tree_cost_angle_weight", type=float, default=0.25)
+    parser.add_argument("--tree_cost_radius_weight", type=float, default=0.25)
+    parser.add_argument("--tree_cost_branch_weight", type=float, default=0.5)
+    parser.add_argument("--tree_sfs_weight", type=float, default=1.0)
+    parser.add_argument("--tree_radius_weight", type=float, default=0.25)
+    parser.add_argument("--tree_angle_weight", type=float, default=0.25)
+    parser.add_argument("--tree_degree_weight", type=float, default=0.02)
+    parser.add_argument("--tree_max_degree", type=int, default=4)
+    parser.add_argument("--tree_radius_margin", type=float, default=0.0)
+    parser.add_argument("--tree_branch_label_weight", type=float, default=0.05)
+    parser.add_argument("--tree_branch_label_target", type=float, default=0.8)
+    parser.add_argument("--tree_branch_label_min_prob", type=float, default=0.25)
+    parser.add_argument("--tree_neg_per_pos", type=int, default=3)
+    parser.add_argument("--tree_stage_c_invariant_scale", type=float, default=0.25)
+    parser.add_argument("--tree_stage_c_degree_scale", type=float, default=0.0)
+    parser.add_argument("--tree_debug_interval", type=int, default=500)
     parser.add_argument('--gpu', type=int, default=0, help='Index of GPU device to use.')
     parser.add_argument("--reg_mask", action="store_true", default=False)
     parser.add_argument("--reg_align", action="store_true", default=False)
@@ -1354,6 +1444,7 @@ if __name__ == "__main__":
     parser.add_argument("--reg_freq", action="store_true", default=False)
     parser.add_argument("--reg_opacity", action="store_true", default=False)
     parser.add_argument("--reg_mst", action="store_true", default=False)
+    parser.add_argument("--reg_tree_stpr", "--use_tree_constraint_loss", dest="reg_tree_stpr", action="store_true", default=False)
     parser.add_argument("--max_stpr_num", type=int, default=2000 )
 
     
