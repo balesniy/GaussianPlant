@@ -98,13 +98,25 @@ def add_tree_constrained_stpr_loss(gaussians, loss, args, iteration, stage):
         forest_max_edge_length=args.tree_forest_max_edge_length,
         forest_max_edge_cost=args.tree_forest_max_edge_cost,
         distance_weight=args.tree_cost_distance_weight,
+        center_distance_weight=args.tree_cost_center_distance_weight,
         angle_weight=args.tree_cost_angle_weight,
         radius_cost_weight=args.tree_cost_radius_weight,
         branch_weight=args.tree_cost_branch_weight,
+        root_direction_weight=args.tree_cost_root_direction_weight,
+        use_graph_gnn=args.tree_use_graph_gnn,
+        graph_gnn_hidden_dim=args.tree_gnn_hidden_dim,
+        graph_gnn_layers=args.tree_gnn_layers,
+        graph_gnn_weight=args.tree_gnn_weight,
+        graph_gnn_lr=args.tree_gnn_lr,
         sfs_weight=args.tree_sfs_weight,
         radius_weight=args.tree_radius_weight * stage_c_scale,
         angle_loss_weight=args.tree_angle_weight * stage_c_scale,
         degree_weight=args.tree_degree_weight * stage_c_degree_scale,
+        leaf_attachment_weight=args.tree_leaf_attachment_weight * stage_c_scale,
+        vascular_flow_weight=args.tree_vascular_flow_weight * stage_c_scale,
+        trunk_root_weight=args.tree_trunk_root_weight * stage_c_scale,
+        trunk_flow_weight=args.tree_trunk_flow_weight * stage_c_scale,
+        trunk_radius_weight=args.tree_trunk_radius_weight * stage_c_scale,
         max_degree=args.tree_max_degree,
         radius_margin=args.tree_radius_margin,
         branch_label_weight=args.tree_branch_label_weight,
@@ -128,7 +140,11 @@ def add_tree_constrained_stpr_loss(gaussians, loss, args, iteration, stage):
                 f"hard_neg_logit={stats['mean_hard_negative_logit']:.4g} "
                 f"radius_viol={stats['radius_violation_rate']:.3f} "
                 f"pst_sel={stats['pst_selected_mean']:.3f} "
-                f"max_degree={stats['max_degree']:.1f}"
+                f"max_degree={stats['max_degree']:.1f} "
+                f"gnn_logit={stats.get('gnn_edge_logit_mean', 0.0):.4g} "
+                f"trunk_p={stats.get('trunk_prob_mean', 0.0):.3f} "
+                f"leaf_attach={stats.get('leaf_attachment_count', 0)} "
+                f"flow_loss={stats.get('vascular_flow_loss', 0.0):.4g}"
             )
     return loss, tree_loss
 
@@ -573,8 +589,9 @@ def stpr_semantic_prototype_loss(gaussians_root, args):
     branch_proto = load_semantic_prototype(args.stpr_branch_proto, args)
     if leaf_proto is None or branch_proto is None:
         return torch.tensor(0.0, device=args.device)
+    trunk_proto = load_semantic_prototype(args.stpr_trunk_proto, args)
 
-    dim = min(app_feat.shape[1], leaf_proto.numel(), branch_proto.numel())
+    dim = min(app_feat.shape[1], leaf_proto.numel(), branch_proto.numel(), trunk_proto.numel() if trunk_proto is not None else app_feat.shape[1])
     if isinstance(gaussians_root.nn_stpr_appgs, list):
         parent = torch.stack(gaussians_root.nn_stpr_appgs, dim=0).to(args.device).view(-1)
     else:
@@ -589,8 +606,18 @@ def stpr_semantic_prototype_loss(gaussians_root, args):
     leaf_proto = F.normalize(leaf_proto[:dim].view(1, -1), dim=-1)
     branch_proto = F.normalize(branch_proto[:dim].view(1, -1), dim=-1)
     st_norm = F.normalize(st_feat, dim=-1)
-    logits = torch.cat([(st_norm * leaf_proto).sum(dim=-1, keepdim=True), (st_norm * branch_proto).sum(dim=-1, keepdim=True)], dim=-1)
     p_branch = torch.sigmoid(stprs._pst_logit).view(-1)
+    if trunk_proto is not None and stprs._stpr_type_logit is not None:
+        trunk_proto = F.normalize(trunk_proto[:dim].view(1, -1), dim=-1)
+        logits = torch.cat([
+            (st_norm * trunk_proto).sum(dim=-1, keepdim=True),
+            (st_norm * branch_proto).sum(dim=-1, keepdim=True),
+            (st_norm * leaf_proto).sum(dim=-1, keepdim=True),
+        ], dim=-1)
+        type_targets = F.softmax(stprs._stpr_type_logit, dim=-1).detach()
+        log_probs = F.log_softmax(logits / max(args.stpr_semantic_temperature, 1e-6), dim=-1)
+        return -(type_targets * log_probs).sum(dim=-1).mean()
+    logits = torch.cat([(st_norm * leaf_proto).sum(dim=-1, keepdim=True), (st_norm * branch_proto).sum(dim=-1, keepdim=True)], dim=-1)
     log_probs = F.log_softmax(logits / max(args.stpr_semantic_temperature, 1e-6), dim=-1)
     return -((1.0 - p_branch) * log_probs[:, 0] + p_branch * log_probs[:, 1]).mean()
 
@@ -1351,6 +1378,7 @@ if __name__ == "__main__":
     parser.add_argument("--dino_sem_interval", type=int, default=1)
     parser.add_argument("--lambda_dino_sem", type=float, default=0.0)
     parser.add_argument("--lambda_stpr_sem_proto", type=float, default=0.0)
+    parser.add_argument("--stpr_trunk_proto", type=str, default="")
     parser.add_argument("--stpr_leaf_proto", type=str, default="")
     parser.add_argument("--stpr_branch_proto", type=str, default="")
     parser.add_argument("--stpr_semantic_temperature", type=float, default=0.07)
@@ -1421,13 +1449,25 @@ if __name__ == "__main__":
     parser.add_argument("--tree_forest_max_edge_length", type=float, default=0.0)
     parser.add_argument("--tree_forest_max_edge_cost", type=float, default=0.0)
     parser.add_argument("--tree_cost_distance_weight", type=float, default=1.0)
+    parser.add_argument("--tree_cost_center_distance_weight", type=float, default=0.25)
     parser.add_argument("--tree_cost_angle_weight", type=float, default=0.25)
     parser.add_argument("--tree_cost_radius_weight", type=float, default=0.25)
     parser.add_argument("--tree_cost_branch_weight", type=float, default=0.5)
+    parser.add_argument("--tree_cost_root_direction_weight", type=float, default=0.0)
+    parser.add_argument("--tree_use_graph_gnn", action="store_true", default=False)
+    parser.add_argument("--tree_gnn_hidden_dim", type=int, default=64)
+    parser.add_argument("--tree_gnn_layers", type=int, default=2)
+    parser.add_argument("--tree_gnn_weight", type=float, default=1.0)
+    parser.add_argument("--tree_gnn_lr", type=float, default=0.0025)
     parser.add_argument("--tree_sfs_weight", type=float, default=1.0)
     parser.add_argument("--tree_radius_weight", type=float, default=0.25)
     parser.add_argument("--tree_angle_weight", type=float, default=0.25)
     parser.add_argument("--tree_degree_weight", type=float, default=0.02)
+    parser.add_argument("--tree_leaf_attachment_weight", type=float, default=0.0)
+    parser.add_argument("--tree_vascular_flow_weight", type=float, default=0.0)
+    parser.add_argument("--tree_trunk_root_weight", type=float, default=0.0)
+    parser.add_argument("--tree_trunk_flow_weight", type=float, default=0.0)
+    parser.add_argument("--tree_trunk_radius_weight", type=float, default=0.0)
     parser.add_argument("--tree_max_degree", type=int, default=4)
     parser.add_argument("--tree_radius_margin", type=float, default=0.0)
     parser.add_argument("--tree_branch_label_weight", type=float, default=0.05)

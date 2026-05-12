@@ -146,6 +146,67 @@ def run_kmeans(features, k, niter=25, nredo=3):
     kmeans = KMeans(n_clusters=k, n_init=nredo, max_iter=niter, random_state=0)
     return kmeans.fit_predict(features)
 
+
+class StPrGraphEdgeGNN(nn.Module):
+    def __init__(self, node_dim, edge_dim, hidden_dim=64, num_layers=2):
+        super().__init__()
+        self.node_dim = int(node_dim)
+        self.edge_dim = int(edge_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_layers = int(num_layers)
+        self.node_proj = nn.Sequential(
+            nn.Linear(self.node_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.edge_proj = nn.Sequential(
+            nn.Linear(self.edge_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.message_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(3 * self.hidden_dim, self.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+            )
+            for _ in range(self.num_layers)
+        ])
+        self.update_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(2 * self.hidden_dim, self.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+            )
+            for _ in range(self.num_layers)
+        ])
+        self.edge_head = nn.Sequential(
+            nn.Linear(3 * self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, 1),
+        )
+        nn.init.zeros_(self.edge_head[-1].weight)
+        nn.init.zeros_(self.edge_head[-1].bias)
+
+    def forward(self, node_feats, edge_idx, edge_feats):
+        h = self.node_proj(node_feats)
+        e = self.edge_proj(edge_feats)
+        src = edge_idx[:, 0]
+        dst = edge_idx[:, 1]
+        for message_mlp, update_mlp in zip(self.message_mlps, self.update_mlps):
+            msg_fwd = message_mlp(torch.cat([h[src], h[dst], e], dim=-1))
+            msg_rev = message_mlp(torch.cat([h[dst], h[src], e], dim=-1))
+            agg = torch.zeros_like(h)
+            deg = torch.zeros((h.shape[0], 1), dtype=h.dtype, device=h.device)
+            agg.index_add_(0, dst, msg_fwd)
+            agg.index_add_(0, src, msg_rev)
+            deg.index_add_(0, dst, torch.ones((dst.shape[0], 1), dtype=h.dtype, device=h.device))
+            deg.index_add_(0, src, torch.ones((src.shape[0], 1), dtype=h.dtype, device=h.device))
+            agg = agg / deg.clamp(min=1.0)
+            h = h + update_mlp(torch.cat([h, agg], dim=-1))
+        return self.edge_head(torch.cat([h[src], h[dst], e], dim=-1)).view(-1)
+
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -197,8 +258,11 @@ class GaussianModel:
         self.stpr_label = None 
         self.app_label = None
         self._pst_logit = None
+        self._stpr_type_logit = None
         self._semantic_logit = None
         self._semantic_feature = torch.empty(0)
+        self._stpr_graph_gnn = None
+        self._stpr_graph_gnn_config = None
 
     def capture(self):
         return (
@@ -222,8 +286,11 @@ class GaussianModel:
                 "exposure": self._exposure,
                 "exposure_optimizer": self.exposure_optimizer.state_dict() if hasattr(self, "exposure_optimizer") else None,
                 "pst_logit": self._pst_logit,
+                "stpr_type_logit": self._stpr_type_logit,
                 "semantic_logit": self._semantic_logit,
                 "semantic_feature": self._semantic_feature,
+                "stpr_graph_gnn_config": self._stpr_graph_gnn_config,
+                "stpr_graph_gnn_state": self._stpr_graph_gnn.state_dict() if self._stpr_graph_gnn is not None else None,
             },
         )
     
@@ -249,11 +316,18 @@ class GaussianModel:
         if metadata.get("exposure") is not None:
             self._exposure = metadata["exposure"]
         self._pst_logit = metadata.get("pst_logit")
+        self._stpr_type_logit = metadata.get("stpr_type_logit")
         self._semantic_logit = metadata.get(
             "semantic_logit",
             nn.Parameter(torch.zeros((self._xyz.shape[0], 1), dtype=torch.float, device=self.device).requires_grad_(True))
         )
         self._semantic_feature = metadata.get("semantic_feature", torch.empty(0, device=self.device))
+        gnn_config = metadata.get("stpr_graph_gnn_config")
+        if gnn_config is not None:
+            self._stpr_graph_gnn_config = gnn_config
+            self._stpr_graph_gnn = StPrGraphEdgeGNN(**gnn_config).to(self.device)
+            if metadata.get("stpr_graph_gnn_state") is not None:
+                self._stpr_graph_gnn.load_state_dict(metadata["stpr_graph_gnn_state"])
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -362,6 +436,53 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
+    def ensure_stpr_graph_gnn(self, node_dim, edge_dim, hidden_dim=64, num_layers=2, lr=0.0025):
+        config = {
+            "node_dim": int(node_dim),
+            "edge_dim": int(edge_dim),
+            "hidden_dim": int(hidden_dim),
+            "num_layers": int(num_layers),
+        }
+        if self._stpr_graph_gnn is None or self._stpr_graph_gnn_config != config:
+            self._stpr_graph_gnn = StPrGraphEdgeGNN(**config).to(self.get_xyz.device)
+            self._stpr_graph_gnn_config = config
+            if self.optimizer is not None:
+                self.optimizer.add_param_group({
+                    "params": self._stpr_graph_gnn.parameters(),
+                    "lr": lr,
+                    "name": "stpr_graph_gnn",
+                })
+        return self._stpr_graph_gnn
+
+    def initialize_stpr_type_logits(self, labels, confidence=2.0):
+        labels = labels or []
+        n = len(labels)
+        if n == 0:
+            return
+        logits = torch.full((n, 3), -float(confidence), dtype=torch.float, device=self.device)
+        branch_indices = [idx for idx, label in enumerate(labels) if label == "branch"]
+        leaf_indices = [idx for idx, label in enumerate(labels) if label == "leaf"]
+        if branch_indices:
+            branch_idx = torch.tensor(branch_indices, dtype=torch.long, device=self.device)
+            xyz = self.get_xyz[branch_idx].detach()
+            scales = self.get_scaling[branch_idx].detach()
+            radius = scales[:, 1:].mean(dim=-1)
+            root_axis = 2
+            height = xyz[:, root_axis]
+            radius_score = (radius - radius.min()) / (radius.max() - radius.min()).clamp(min=1e-6)
+            base_score = (height.max() - height) / (height.max() - height.min()).clamp(min=1e-6)
+            trunk_score = 0.6 * radius_score + 0.4 * base_score
+            trunk_count = max(1, min(int(np.ceil(0.15 * len(branch_indices))), len(branch_indices)))
+            trunk_local = torch.topk(trunk_score, k=trunk_count, largest=True).indices
+            trunk_idx = branch_idx[trunk_local]
+            logits[branch_idx, 1] = float(confidence)
+            logits[trunk_idx, 0] = float(confidence)
+            logits[trunk_idx, 1] = 0.0
+        if leaf_indices:
+            leaf_idx = torch.tensor(leaf_indices, dtype=torch.long, device=self.device)
+            logits[leaf_idx, 2] = float(confidence)
+        self._stpr_type_logit = nn.Parameter(logits.requires_grad_(True))
+
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
@@ -410,6 +531,8 @@ class GaussianModel:
         ]
         if self._semantic_feature.numel():
             l.append({'params': [self._semantic_feature], 'lr': training_args.feature_lr, "name": "semantic_feature"})
+        if self._stpr_graph_gnn is not None:
+            l.append({'params': self._stpr_graph_gnn.parameters(), 'lr': training_args.feature_lr, "name": "stpr_graph_gnn"})
 
         if self.optimizer_type == "default":
             self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -423,6 +546,8 @@ class GaussianModel:
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
         if self._pst_logit is not None and self.optimizer is not None:
             self.optimizer.add_param_group({'params': [self._pst_logit], 'lr': training_args.opacity_lr, "name": "pst"})
+        if self._stpr_type_logit is not None and self.optimizer is not None:
+            self.optimizer.add_param_group({'params': [self._stpr_type_logit], 'lr': training_args.opacity_lr, "name": "stpr_type"})
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -517,6 +642,8 @@ class GaussianModel:
             clone.app_label = [lbl for lbl, keep in zip(self.app_label, keep_mask.detach().cpu().tolist()) if keep]
         if copy_structure_metadata and self._pst_logit is not None:
             clone._pst_logit = nn.Parameter(self._pst_logit.detach()[keep_mask].clone().requires_grad_(True))
+        if copy_structure_metadata and self._stpr_type_logit is not None:
+            clone._stpr_type_logit = nn.Parameter(self._stpr_type_logit.detach()[keep_mask].clone().requires_grad_(True))
         return clone
 
     def reset_opacity(self):
@@ -617,6 +744,8 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
+            if len(group["params"]) != 1 or group["name"] == "stpr_graph_gnn":
+                continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -645,6 +774,8 @@ class GaussianModel:
             self._semantic_logit = optimizable_tensors["semantic"]
         if "semantic_feature" in optimizable_tensors:
             self._semantic_feature = optimizable_tensors["semantic_feature"]
+        if "stpr_type" in optimizable_tensors:
+            self._stpr_type_logit = optimizable_tensors["stpr_type"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
@@ -668,6 +799,8 @@ class GaussianModel:
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
+            if group["name"] not in tensors_dict:
+                continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -687,7 +820,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_label=None, flag=None, new_pst_logit=None, new_semantic=None, new_semantic_feature=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_label=None, flag=None, new_pst_logit=None, new_semantic=None, new_semantic_feature=None, new_stpr_type_logit=None):
         self._ensure_mask_shape()
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
@@ -698,6 +831,8 @@ class GaussianModel:
         "rotation" : new_rotation}
         if self._pst_logit is not None and new_pst_logit is not None:
             d["pst"] = new_pst_logit
+        if self._stpr_type_logit is not None and new_stpr_type_logit is not None:
+            d["stpr_type"] = new_stpr_type_logit
         if self._semantic_feature.numel():
             if new_semantic_feature is None:
                 new_semantic_feature = torch.zeros((new_xyz.shape[0], self._semantic_feature.shape[1]), dtype=self._semantic_feature.dtype, device=self.device)
@@ -713,6 +848,8 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         if "pst" in optimizable_tensors:
             self._pst_logit = optimizable_tensors["pst"]
+        if "stpr_type" in optimizable_tensors:
+            self._stpr_type_logit = optimizable_tensors["stpr_type"]
         if "semantic_feature" in optimizable_tensors:
             self._semantic_feature = optimizable_tensors["semantic_feature"]
 
@@ -758,6 +895,7 @@ class GaussianModel:
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
         new_label = None
         new_pst_logit = None
+        new_stpr_type_logit = None
         if flag == 'app':
             new_label = [lbl for lbl, m in zip(self.app_label, selected_pts_mask) if m]
             new_label = new_label * N
@@ -766,10 +904,12 @@ class GaussianModel:
             new_label = new_label * N
             if self._pst_logit is not None:
                 new_pst_logit = self._pst_logit[selected_pts_mask].repeat(N, 1)
+            if self._stpr_type_logit is not None:
+                new_stpr_type_logit = self._stpr_type_logit[selected_pts_mask].repeat(N, 1)
         elif flag is not None:
             raise ValueError(f"Unknown densification flag: {flag}")
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii,new_label,flag,new_pst_logit,new_semantic,new_semantic_feature)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii,new_label,flag,new_pst_logit,new_semantic,new_semantic_feature,new_stpr_type_logit)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device=self.device, dtype=bool)))
         self.prune_points(prune_filter)
@@ -792,16 +932,19 @@ class GaussianModel:
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
         new_label = None
         new_pst_logit = None
+        new_stpr_type_logit = None
         if flag == 'app':
             new_label = [lbl for lbl, m in zip(self.app_label, selected_pts_mask) if m]
         elif flag == 'stpr':
             new_label = [lbl for lbl, m in zip(self.stpr_label, selected_pts_mask) if m]
             if self._pst_logit is not None:
                 new_pst_logit = self._pst_logit[selected_pts_mask]
+            if self._stpr_type_logit is not None:
+                new_stpr_type_logit = self._stpr_type_logit[selected_pts_mask]
         elif flag is not None:
             raise ValueError(f"Unknown densification flag: {flag}")
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii,new_label,flag,new_pst_logit,new_semantic,new_semantic_feature)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii,new_label,flag,new_pst_logit,new_semantic,new_semantic_feature,new_stpr_type_logit)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, flag='stpr', only_prune=False, size_threshold_small=None):
         grads = self.xyz_gradient_accum / self.denom
@@ -1254,6 +1397,7 @@ class GaussianModel:
                 p0.append(0.5)
         p0 = torch.tensor(p0, dtype=torch.float, device=self.device).clamp(1e-4, 1.0 - 1e-4).unsqueeze(1)
         self.structure_gs._pst_logit = nn.Parameter(torch.log(p0 / (1.0 - p0)).requires_grad_(True))
+        self.structure_gs.initialize_stpr_type_logits(stpr_label)
         exposure = self._exposure.detach()
         self.structure_gs._exposure = nn.Parameter(exposure.requires_grad_(True))
         print(f"Initialized {len(stpr_positions)} Structural Primitives (StPrs) from Gaussian clustering.")
@@ -2112,13 +2256,25 @@ class GaussianModel:
             forest_max_edge_length=0.0,
             forest_max_edge_cost=0.0,
             distance_weight=1.0,
+            center_distance_weight=0.25,
             angle_weight=0.25,
             radius_cost_weight=0.25,
             branch_weight=0.5,
+            root_direction_weight=0.0,
+            use_graph_gnn=False,
+            graph_gnn_hidden_dim=64,
+            graph_gnn_layers=2,
+            graph_gnn_weight=1.0,
+            graph_gnn_lr=0.0025,
             sfs_weight=1.0,
             radius_weight=0.25,
             angle_loss_weight=0.25,
             degree_weight=0.02,
+            leaf_attachment_weight=0.0,
+            vascular_flow_weight=0.0,
+            trunk_root_weight=0.0,
+            trunk_flow_weight=0.0,
+            trunk_radius_weight=0.0,
             max_degree=4,
             radius_margin=0.0,
             branch_label_weight=0.05,
@@ -2132,7 +2288,11 @@ class GaussianModel:
 
         stprs = self.structure_gs
         device = stprs.get_xyz.device
-        if stprs._pst_logit is not None:
+        type_probs = F.softmax(stprs._stpr_type_logit, dim=-1) if stprs._stpr_type_logit is not None else None
+        if type_probs is not None:
+            p_branch = (type_probs[:, 0] + type_probs[:, 1]).clamp(0.0, 1.0)
+            branch_mask = p_branch > 0.5
+        elif stprs._pst_logit is not None:
             p_branch = torch.sigmoid(stprs._pst_logit).view(-1)
             branch_mask = p_branch > 0.5
         elif stprs.stpr_label is None:
@@ -2172,7 +2332,20 @@ class GaussianModel:
         rot_matrix = quaternion_to_matrix(rot)
         axis = F.normalize(rot_matrix[:, :, 0], dim=-1, eps=1e-8)
         radius = scales[:, 1:].mean(dim=-1)
+        half_length = scales[:, 0] * 1.5
+        top = xyz + half_length[:, None] * axis
+        bottom = xyz - half_length[:, None] * axis
         p_branch_kept = torch.sigmoid(stprs._pst_logit[branch_indices]).view(-1) if stprs._pst_logit is not None else torch.ones((n,), device=device)
+        if type_probs is not None:
+            type_probs_kept = type_probs[branch_indices]
+            p_trunk_kept = type_probs_kept[:, 0]
+            p_branch_only_kept = type_probs_kept[:, 1]
+            p_leaf_kept = type_probs_kept[:, 2]
+            p_branch_kept = (p_trunk_kept + p_branch_only_kept).clamp(0.0, 1.0)
+        else:
+            p_trunk_kept = torch.zeros((n,), dtype=xyz.dtype, device=device)
+            p_branch_only_kept = p_branch_kept
+            p_leaf_kept = 1.0 - p_branch_kept
 
         query_k = min(max(int(knn), 1) + 1, n)
         with torch.no_grad():
@@ -2184,6 +2357,20 @@ class GaussianModel:
                     a, b = sorted((int(i), int(j)))
                     if a != b:
                         edge_set.add((a, b))
+            endpoints = torch.stack([top.detach(), bottom.detach()], dim=1).reshape(-1, 3)
+            endpoint_dist = torch.cdist(endpoints, endpoints, p=2)
+            endpoint_dist[torch.arange(2 * n, device=device), torch.arange(2 * n, device=device)] = float("inf")
+            endpoint_k = min(max(int(knn), 1) + 1, 2 * n)
+            _, endpoint_nbr = torch.topk(endpoint_dist, k=endpoint_k, largest=False, dim=1)
+            for endpoint_i in range(2 * n):
+                node_i = endpoint_i // 2
+                for endpoint_j in endpoint_nbr[endpoint_i].detach().cpu().tolist():
+                    if endpoint_j >= 2 * n:
+                        continue
+                    node_j = int(endpoint_j) // 2
+                    a, b = sorted((int(node_i), node_j))
+                    if a != b:
+                        edge_set.add((a, b))
             if not edge_set:
                 return xyz.sum() * 0.0
             edge_np = np.asarray(sorted(edge_set), dtype=np.int64)
@@ -2192,18 +2379,70 @@ class GaussianModel:
         a = edge_idx[:, 0]
         b = edge_idx[:, 1]
         delta = xyz[b] - xyz[a]
-        dist = torch.linalg.norm(delta, dim=-1).clamp(min=1e-8)
-        edge_dir = delta / dist[:, None]
+        center_dist = torch.linalg.norm(delta, dim=-1).clamp(min=1e-8)
+        endpoint_pairs_a = torch.stack([top[a], top[a], bottom[a], bottom[a]], dim=1)
+        endpoint_pairs_b = torch.stack([top[b], bottom[b], top[b], bottom[b]], dim=1)
+        endpoint_delta = endpoint_pairs_b - endpoint_pairs_a
+        endpoint_pair_dist = torch.linalg.norm(endpoint_delta, dim=-1).clamp(min=1e-8)
+        endpoint_dist_min, endpoint_choice = endpoint_pair_dist.min(dim=1)
+        endpoint_delta_min = endpoint_delta[torch.arange(endpoint_delta.shape[0], device=device), endpoint_choice]
+        edge_dir = endpoint_delta_min / endpoint_dist_min[:, None]
         axis_align = torch.maximum(torch.abs((axis[a] * edge_dir).sum(dim=-1)), torch.abs((axis[b] * edge_dir).sum(dim=-1)))
         radius_ratio = torch.minimum(radius[a], radius[b]) / torch.maximum(radius[a], radius[b]).clamp(min=1e-8)
         radius_penalty_cost = 1.0 - radius_ratio
         branch_conf = torch.minimum(p_branch_kept[a], p_branch_kept[b])
+        trunk_continuity = torch.minimum(p_trunk_kept[a], p_trunk_kept[b])
+        leaf_pair_penalty = torch.maximum(p_leaf_kept[a], p_leaf_kept[b])
+        root_axis_idx = int(root_axis) if 0 <= int(root_axis) < 3 else 2
+        root_direction_cost = 1.0 - torch.abs(delta[:, root_axis_idx]) / center_dist
         cost = (
-            distance_weight * dist
+            distance_weight * endpoint_dist_min
+            + center_distance_weight * center_dist
             + angle_weight * (1.0 - axis_align)
             + radius_cost_weight * radius_penalty_cost
             - branch_weight * branch_conf
+            - 0.25 * branch_weight * trunk_continuity
+            + 0.5 * branch_weight * leaf_pair_penalty
+            + root_direction_weight * root_direction_cost
         )
+        learned_edge_logit = None
+        if use_graph_gnn:
+            graph_scale = torch.quantile(center_dist.detach(), 0.75).clamp(min=1e-4)
+            xyz_centered = (xyz - xyz.detach().mean(dim=0, keepdim=True)) / graph_scale
+            node_height = xyz_centered[:, root_axis_idx:root_axis_idx + 1] if 0 <= root_axis_idx < 3 else xyz_centered[:, 2:3]
+            node_feats = torch.cat([
+                xyz_centered,
+                axis,
+                (radius / graph_scale).unsqueeze(-1),
+                (half_length / graph_scale).unsqueeze(-1),
+                p_trunk_kept.unsqueeze(-1),
+                p_branch_only_kept.unsqueeze(-1),
+                p_leaf_kept.unsqueeze(-1),
+                p_branch_kept.unsqueeze(-1),
+                node_height,
+            ], dim=-1)
+            edge_feats = torch.stack([
+                endpoint_dist_min / graph_scale,
+                center_dist / graph_scale,
+                axis_align,
+                radius_ratio,
+                branch_conf,
+                torch.minimum(p_trunk_kept[a], p_trunk_kept[b]),
+                torch.maximum(p_leaf_kept[a], p_leaf_kept[b]),
+                torch.abs(delta[:, root_axis_idx]) / center_dist,
+                p_branch_kept[a],
+                p_branch_kept[b],
+                radius_penalty_cost,
+            ], dim=-1)
+            edge_gnn = stprs.ensure_stpr_graph_gnn(
+                node_dim=node_feats.shape[-1],
+                edge_dim=edge_feats.shape[-1],
+                hidden_dim=graph_gnn_hidden_dim,
+                num_layers=graph_gnn_layers,
+                lr=graph_gnn_lr,
+            )
+            learned_edge_logit = edge_gnn(node_feats, edge_idx, edge_feats)
+            cost = cost - float(graph_gnn_weight) * learned_edge_logit
         edge_logits = -cost
 
         with torch.no_grad():
@@ -2214,7 +2453,7 @@ class GaussianModel:
                 edge_np,
                 cost.detach().cpu().numpy(),
                 max_edge_length=float(forest_max_edge_length) if use_forest_thresholds else 0.0,
-                edge_lengths=dist.detach().cpu().numpy(),
+                edge_lengths=endpoint_dist_min.detach().cpu().numpy(),
                 max_edge_cost=float(forest_max_edge_cost) if use_forest_thresholds else 0.0,
             )
             if selected_np.shape[0] == 0:
@@ -2239,7 +2478,7 @@ class GaussianModel:
 
         with torch.no_grad():
             selected_edge_indices = np.flatnonzero(target_np > 0.5)
-            edge_lengths_np = dist.detach().cpu().numpy()
+            edge_lengths_np = endpoint_dist_min.detach().cpu().numpy()
             component_parent = np.arange(n, dtype=np.int64)
 
             def component_find(x):
@@ -2264,6 +2503,7 @@ class GaussianModel:
                 "component_count": int(component_count),
                 "mean_selected_edge_length": float(edge_lengths_np[selected_edge_indices].mean()) if selected_edge_indices.size else 0.0,
                 "mean_hard_negative_logit": float(neg_logits.detach().mean().item()) if "neg_logits" in locals() and neg_logits.numel() else 0.0,
+                "gnn_edge_logit_mean": float(learned_edge_logit.detach().mean().item()) if learned_edge_logit is not None else 0.0,
                 "radius_violation_rate": 0.0,
                 "pst_selected_mean": float(p_branch_kept[selected_nodes_t].detach().mean().item()) if selected_nodes_t.numel() else 0.0,
                 "max_degree": 0.0,
@@ -2303,11 +2543,76 @@ class GaussianModel:
         else:
             branch_label_loss = edge_logits.sum() * 0.0
 
+        leaf_attachment_loss = edge_logits.sum() * 0.0
+        flow_loss = edge_logits.sum() * 0.0
+        trunk_root_loss = edge_logits.sum() * 0.0
+        trunk_flow_loss = edge_logits.sum() * 0.0
+        trunk_radius_loss = edge_logits.sum() * 0.0
+        leaf_attachment_count = 0
+        trunk_mass = p_trunk_kept.sum().clamp(min=1e-6)
+        height_norm = (xyz[:, root_axis_idx] - xyz[:, root_axis_idx].min()) / (xyz[:, root_axis_idx].max() - xyz[:, root_axis_idx].min()).clamp(min=1e-6)
+        trunk_root_loss = (p_trunk_kept * height_norm).sum() / trunk_mass
+        branch_radius_mean = (p_branch_only_kept.detach() * radius).sum() / p_branch_only_kept.detach().sum().clamp(min=1e-6)
+        trunk_radius_loss = (p_trunk_kept * F.relu(branch_radius_mean - radius + radius_margin)).sum() / trunk_mass
+        if (leaf_attachment_weight > 0 or vascular_flow_weight > 0) and stprs.get_xyz.shape[0] > n:
+            if type_probs is not None:
+                leaf_mask = type_probs[:, 2] > 0.5
+            elif stprs._pst_logit is not None:
+                leaf_mask = torch.sigmoid(stprs._pst_logit).view(-1) < 0.5
+            elif stprs.stpr_label is not None:
+                leaf_mask = torch.tensor([lbl != "branch" for lbl in stprs.stpr_label], dtype=torch.bool, device=device)
+            else:
+                leaf_mask = torch.zeros((stprs.get_xyz.shape[0],), dtype=torch.bool, device=device)
+            leaf_mask[branch_indices] = False
+            leaf_indices = torch.nonzero(leaf_mask, as_tuple=False).view(-1)
+            leaf_attachment_count = int(leaf_indices.numel())
+            if leaf_indices.numel() > 0:
+                leaf_xyz = stprs.get_xyz[leaf_indices]
+                leaf_scales = stprs.get_scaling[leaf_indices]
+                leaf_area = leaf_scales[:, 0:2].prod(dim=-1).detach().clamp(min=1e-6)
+                leaf_to_center = torch.cdist(leaf_xyz, xyz, p=2)
+                leaf_parent = torch.argmin(leaf_to_center.detach(), dim=1)
+                assigned_delta = leaf_xyz - xyz[leaf_parent]
+                assigned_axis = axis[leaf_parent]
+                axial = (assigned_delta * assigned_axis).sum(dim=-1).clamp(min=-half_length[leaf_parent], max=half_length[leaf_parent])
+                closest = xyz[leaf_parent] + axial[:, None] * assigned_axis
+                attach_dist = torch.linalg.norm(leaf_xyz - closest, dim=-1)
+                leaf_branch_prob = p_branch_kept[leaf_parent]
+                leaf_self_prob = torch.sigmoid(stprs._pst_logit[leaf_indices]).view(-1) if stprs._pst_logit is not None else torch.zeros_like(attach_dist)
+                leaf_attachment_loss = (attach_dist / radius[leaf_parent].clamp(min=1e-4)).mean()
+                leaf_attachment_loss = leaf_attachment_loss + 0.1 * leaf_branch_prob.neg().add(1.0).mean()
+                leaf_attachment_loss = leaf_attachment_loss + 0.1 * leaf_self_prob.mean()
+
+                if vascular_flow_weight > 0 and child.numel() > 0:
+                    with torch.no_grad():
+                        node_demand = torch.zeros((n,), dtype=radius.dtype, device=device)
+                        node_demand.index_add_(0, leaf_parent, leaf_area.to(device=device, dtype=radius.dtype))
+                        downstream = node_demand.clone()
+                        for edge_i in range(oriented.shape[0] - 1, -1, -1):
+                            downstream[parent[edge_i]] += downstream[child[edge_i]]
+                        edge_flow = downstream[child].clamp(min=1e-6)
+                    if edge_flow.numel() > 1 and torch.var(edge_flow) > 1e-10:
+                        log_flow = torch.log(edge_flow)
+                        log_flow = (log_flow - log_flow.mean()) / log_flow.std().clamp(min=1e-6)
+                        log_radius = torch.log(radius[parent].clamp(min=1e-6))
+                        log_radius = (log_radius - log_radius.mean()) / log_radius.std().clamp(min=1e-6)
+                        flow_loss = F.smooth_l1_loss(log_radius, log_flow)
+                        max_flow = edge_flow.detach().max().clamp(min=1e-6)
+                        parent_flow = torch.zeros((n,), dtype=radius.dtype, device=device)
+                        parent_flow.index_add_(0, parent, edge_flow.detach())
+                        flow_norm = (parent_flow / max_flow).clamp(0.0, 1.0)
+                        trunk_flow_loss = F.binary_cross_entropy(p_trunk_kept.clamp(1e-6, 1.0 - 1e-6), flow_norm)
+
         with torch.no_grad():
             self.tree_constraint_stats.update({
                 "radius_violation_rate": float((radius[child] > radius[parent] + radius_margin).float().mean().item()) if child.numel() else 0.0,
                 "pst_selected_mean": float(p_branch_kept[selected_nodes].detach().mean().item()) if selected_nodes.numel() else self.tree_constraint_stats["pst_selected_mean"],
                 "max_degree": float(degree.detach().max().item()) if degree.numel() else 0.0,
+                "leaf_attachment_count": int(leaf_attachment_count),
+                "leaf_attachment_loss": float(leaf_attachment_loss.detach().item()) if torch.is_tensor(leaf_attachment_loss) else 0.0,
+                "vascular_flow_loss": float(flow_loss.detach().item()) if torch.is_tensor(flow_loss) else 0.0,
+                "trunk_prob_mean": float(p_trunk_kept.detach().mean().item()) if p_trunk_kept.numel() else 0.0,
+                "trunk_root_loss": float(trunk_root_loss.detach().item()) if torch.is_tensor(trunk_root_loss) else 0.0,
             })
 
         return (
@@ -2316,4 +2621,9 @@ class GaussianModel:
             + angle_loss_weight * angle_loss
             + degree_weight * degree_loss
             + branch_label_weight * branch_label_loss
+            + leaf_attachment_weight * leaf_attachment_loss
+            + vascular_flow_weight * flow_loss
+            + trunk_root_weight * trunk_root_loss
+            + trunk_flow_weight * trunk_flow_loss
+            + trunk_radius_weight * trunk_radius_loss
         )
