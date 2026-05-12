@@ -1131,7 +1131,8 @@ def reparent_backtracking_branches(points, edges, back_angle_degrees=25.0, hairp
     return points[used].copy(), old_to_new[final_edges].astype(np.int32), surgery_count
 
 def refine_fruit_tree_graph(points, edges, root_axis=2, trunk_height_weight=1.0, trunk_distance_weight=0.25,
-                            prune_min_length=0.25, prune_min_support=3, smooth_iters=5, smooth_lambda=0.35):
+                            prune_min_length=0.25, prune_min_support=3, smooth_iters=5, smooth_lambda=0.35,
+                            max_component_bridge_length=0.0):
     """Apply fruit-tree priors: rooted trunk, short twig pruning, and chain smoothing."""
     points = np.asarray(points, dtype=np.float32)
     edges = np.asarray(edges, dtype=np.int32)
@@ -1140,6 +1141,8 @@ def refine_fruit_tree_graph(points, edges, root_axis=2, trunk_height_weight=1.0,
             "trunk_nodes": 0,
             "pruned_nodes": 0,
             "connected_components_before": 0,
+            "component_bridges_added": 0,
+            "component_bridges_skipped": 0,
             "smooth_iters": 0,
         }
 
@@ -1207,6 +1210,15 @@ def refine_fruit_tree_graph(points, edges, root_axis=2, trunk_height_weight=1.0,
     adjacency, parent, dist, roots, root_of = orient_components(points, edge_set)
     axis = int(np.clip(root_axis, 0, 2))
     connected_components_before = len(roots)
+    component_bridges_added = 0
+    component_bridges_skipped = 0
+    edge_lengths = np.linalg.norm(points[edges[valid, 0]] - points[edges[valid, 1]], axis=1) if valid.any() else np.empty((0,), dtype=np.float32)
+    bridge_limit = float(max_component_bridge_length)
+    if bridge_limit <= 0 and edge_lengths.size:
+        median_len = float(np.median(edge_lengths))
+        mad_len = float(np.median(np.abs(edge_lengths - median_len)))
+        robust_len = median_len + 8.0 * 1.4826 * mad_len
+        bridge_limit = max(float(np.percentile(edge_lengths, 95)) * 3.0, robust_len, median_len * 6.0)
     if len(roots) > 1:
         global_root = min(roots, key=lambda idx: points[idx, axis])
         main_nodes = list(np.flatnonzero(root_of == global_root))
@@ -1219,7 +1231,12 @@ def refine_fruit_tree_graph(points, edges, root_axis=2, trunk_height_weight=1.0,
             tree = cKDTree(points[main_nodes])
             distances, nearest = tree.query(points[component_nodes], k=1)
             best_local = int(np.argmin(distances))
+            best_distance = float(distances[best_local])
+            if bridge_limit > 0 and best_distance > bridge_limit:
+                component_bridges_skipped += 1
+                continue
             edge_set.add(edge_key(component_nodes[best_local], main_nodes[int(nearest[best_local])]))
+            component_bridges_added += 1
             main_nodes.extend(component_nodes.tolist())
         adjacency, parent, dist, roots, root_of = orient_components(points, edge_set)
 
@@ -1282,6 +1299,8 @@ def refine_fruit_tree_graph(points, edges, root_axis=2, trunk_height_weight=1.0,
             "trunk_nodes": len(trunk_nodes),
             "pruned_nodes": len(pruned_nodes),
             "connected_components_before": connected_components_before,
+            "component_bridges_added": component_bridges_added,
+            "component_bridges_skipped": component_bridges_skipped,
             "smooth_iters": 0,
         }
 
@@ -1330,6 +1349,8 @@ def refine_fruit_tree_graph(points, edges, root_axis=2, trunk_height_weight=1.0,
         "trunk_nodes": len(trunk_nodes),
         "pruned_nodes": len(pruned_nodes),
         "connected_components_before": connected_components_before,
+        "component_bridges_added": component_bridges_added,
+        "component_bridges_skipped": component_bridges_skipped,
         "smooth_iters": int(smooth_iters),
     }
 

@@ -258,7 +258,16 @@ def project_gaussians_to_camera(xyz, camera):
     in_bounds = (raw_w > 0) & (x >= 0) & (x <= camera.image_width - 1) & (y >= 0) & (y <= camera.image_height - 1)
     return x, y, in_bounds
 
-def sampled_object_depth_support(camera, grid, args, device):
+
+def gaussian_inverse_depth(xyz, camera):
+    ones = torch.ones((xyz.shape[0], 1), dtype=xyz.dtype, device=xyz.device)
+    xyz_h = torch.cat([xyz, ones], dim=1)
+    view = xyz_h @ camera.world_view_transform.to(xyz.device)
+    z = view[:, 2]
+    return torch.where(z > 1e-6, 1.0 / z.clamp(min=1e-6), torch.zeros_like(z))
+
+
+def sampled_object_depth_support(camera, grid, args, device, point_invdepth=None):
     if (
         args is None
         or getattr(args, "disable_depth_object_filter", False)
@@ -279,9 +288,14 @@ def sampled_object_depth_support(camera, grid, args, device):
             args.depth_bg_object_invdepth_quantile,
         )
         sampled_invdepth = F.grid_sample(mono_invdepth.unsqueeze(0), grid, align_corners=True).view(-1)
-        return (sampled_invdepth > args.depth_bg_min_invdepth) & (
+        support = (sampled_invdepth > args.depth_bg_min_invdepth) & (
             sampled_invdepth >= object_frontier - args.depth_bg_margin
         )
+        if point_invdepth is not None:
+            support = support & (
+                point_invdepth >= sampled_invdepth - args.object_depth_surface_margin
+            )
+        return support
 
 def gaussian_mask_visibility_scores(gaussians, cameras, device, max_cameras=64, args=None):
     xyz = gaussians.get_xyz.detach()
@@ -299,7 +313,8 @@ def gaussian_mask_visibility_scores(gaussians, cameras, device, max_cameras=64, 
         grid_y = (y[in_bounds] / max(camera.image_height - 1, 1)) * 2.0 - 1.0
         grid = torch.stack([grid_x, grid_y], dim=-1).view(1, -1, 1, 2)
         sampled = F.grid_sample(mask, grid, align_corners=True).view(-1)
-        sampled = sampled * sampled_object_depth_support(camera, grid, args, device).float()
+        point_invdepth = gaussian_inverse_depth(xyz[in_bounds], camera)
+        sampled = sampled * sampled_object_depth_support(camera, grid, args, device, point_invdepth).float()
         score_sum[in_bounds] += sampled
         visible_count[in_bounds] += 1.0
         used += 1
@@ -316,6 +331,34 @@ def filter_gaussians_by_masks(gaussians, cameras, threshold, min_views, device, 
         best_idx = torch.argmax(scores)
         keep[best_idx] = True
         print("[DEBUG][object-filter] mask filter would remove all gaussians; keeping best-scoring gaussian.")
+
+    spatial_factor = float(getattr(args, "object_filter_spatial_factor", 8.0)) if args is not None else 8.0
+    if spatial_factor > 0 and int(keep.sum().item()) >= 8:
+        kept_xyz = gaussians.get_xyz.detach()[keep]
+        center = kept_xyz.median(dim=0).values
+        dist = torch.linalg.norm(kept_xyz - center[None, :], dim=1)
+        median = torch.median(dist)
+        mad = torch.median(torch.abs(dist - median))
+        threshold_dist = median + spatial_factor * 1.4826 * mad
+        spatial_keep_local = dist <= threshold_dist
+        min_keep = max(8, int(0.5 * kept_xyz.shape[0]))
+        if int(spatial_keep_local.sum().item()) >= min_keep:
+            keep_indices = torch.nonzero(keep, as_tuple=False).view(-1)
+            spatial_keep = torch.zeros_like(keep, dtype=torch.bool)
+            spatial_keep[keep_indices[spatial_keep_local]] = True
+            removed = int((keep & ~spatial_keep).sum().item())
+            if removed > 0:
+                print(
+                    f"[DEBUG][object-filter] spatial cleanup removed {removed} mask-visible "
+                    f"outlier gaussians; radius_threshold={float(threshold_dist.item()):.6g}"
+                )
+            keep = spatial_keep
+        else:
+            print(
+                f"[DEBUG][object-filter] skipped spatial cleanup because it would keep only "
+                f"{int(spatial_keep_local.sum().item())}/{kept_xyz.shape[0]} gaussians."
+            )
+
     filtered = gaussians.clone_subset(keep)
     print(
         f"[DEBUG][object-filter] num input gaussians={gaussians.get_xyz.shape[0]} "
@@ -336,7 +379,8 @@ def gaussian_projects_inside_mask(gaussians, camera, device, threshold=0.5, args
     grid_y = (y[in_bounds] / max(camera.image_height - 1, 1)) * 2.0 - 1.0
     grid = torch.stack([grid_x, grid_y], dim=-1).view(1, -1, 1, 2)
     sampled = F.grid_sample(mask, grid, align_corners=True).view(-1)
-    result[in_bounds] = (sampled >= threshold) & sampled_object_depth_support(camera, grid, args, device)
+    point_invdepth = gaussian_inverse_depth(gaussians.get_xyz.detach()[in_bounds], camera)
+    result[in_bounds] = (sampled >= threshold) & sampled_object_depth_support(camera, grid, args, device, point_invdepth)
     return result
 
 def find_feature_map_path(feature_dir, image_name):
@@ -854,6 +898,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     prune_min_support=args.tree_prune_min_support,
                     smooth_iters=args.tree_smooth_iters,
                     smooth_lambda=args.tree_smooth_lambda,
+                    max_component_bridge_length=args.tree_max_component_bridge_length,
                 )
                 print(
                     f"[DEBUG][graph] simplified final graph: "
@@ -861,6 +906,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     f"edges={mst_edges.shape[0]}->{simplified_edges.shape[0]} "
                     f"reparented={reparent_count} "
                     f"components_before_tree_refine={tree_stats['connected_components_before']} "
+                    f"component_bridges_added={tree_stats['component_bridges_added']} "
+                    f"component_bridges_skipped={tree_stats['component_bridges_skipped']} "
                     f"trunk_nodes={tree_stats['trunk_nodes']} "
                     f"pruned_twigs={tree_stats['pruned_nodes']}"
                 )
@@ -1385,6 +1432,7 @@ if __name__ == "__main__":
     parser.add_argument("--stpr_semantic_temperature", type=float, default=0.07)
     parser.add_argument("--object_mask_threshold", type=float, default=0.5)
     parser.add_argument("--object_mask_min_views", type=int, default=1)
+    parser.add_argument("--object_filter_spatial_factor", type=float, default=8.0, help="Robust radius factor for removing mask-visible 3D outliers before StPr initialization. 0 disables.")
     parser.add_argument("--appgs_object_mask_threshold", type=float, default=0.5)
     parser.add_argument("--appgs_mask_prune_interval", type=int, default=500)
     parser.add_argument("--appgs_mask_prune_threshold", type=float, default=0.35)
@@ -1412,6 +1460,7 @@ if __name__ == "__main__":
     parser.add_argument("--depth_bg_object_invdepth_quantile", type=float, default=0.15)
     parser.add_argument("--depth_bg_min_invdepth", type=float, default=1e-6)
     parser.add_argument("--depth_bg_margin", type=float, default=0.02)
+    parser.add_argument("--object_depth_surface_margin", type=float, default=0.02)
     parser.add_argument("--depth_bg_gain", type=float, default=8.0)
     parser.add_argument("--depth_bg_power", type=float, default=1.5)
     parser.add_argument("--depth_bg_max_weight", type=float, default=20.0)
@@ -1440,6 +1489,12 @@ if __name__ == "__main__":
     parser.add_argument("--tree_prune_min_support", type=int, default=3)
     parser.add_argument("--tree_smooth_iters", type=int, default=5)
     parser.add_argument("--tree_smooth_lambda", type=float, default=0.35)
+    parser.add_argument(
+        "--tree_max_component_bridge_length",
+        type=float,
+        default=0.0,
+        help="Maximum distance for component bridges in the final tree graph. 0 uses a robust auto-threshold.",
+    )
     parser.add_argument("--lambda_tree_stpr", "--tree_loss_weight", dest="lambda_tree_stpr", type=float, default=0.2)
     parser.add_argument("--tree_loss_warmup_start", type=int, default=-1)
     parser.add_argument("--tree_loss_warmup_end", type=int, default=3000)

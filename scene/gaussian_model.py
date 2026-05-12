@@ -109,6 +109,36 @@ def _minimum_spanning_forest(num_nodes, edges, costs, max_edge_length=0.0, edge_
     return np.asarray(selected, dtype=np.int64)
 
 
+def _spatial_inlier_mask(points, outlier_factor=8.0, min_keep=8):
+    if points.shape[0] < 4:
+        return torch.ones((points.shape[0],), dtype=torch.bool, device=points.device)
+
+    with torch.no_grad():
+        dist = torch.cdist(points.detach(), points.detach(), p=2)
+        diag = torch.arange(points.shape[0], device=points.device)
+        dist[diag, diag] = float("inf")
+        nearest = dist.min(dim=1).values
+        finite = torch.isfinite(nearest)
+        if not finite.any():
+            return torch.ones((points.shape[0],), dtype=torch.bool, device=points.device)
+
+        nn = nearest[finite]
+        median = torch.median(nn)
+        mad = torch.median(torch.abs(nn - median))
+        robust_sigma = 1.4826 * mad
+        p95 = torch.quantile(nn, 0.95) if nn.numel() > 1 else median
+        threshold = torch.maximum(median + float(outlier_factor) * robust_sigma, p95 * 2.0)
+        threshold = torch.maximum(threshold, median * 3.0)
+        inlier = nearest <= threshold
+
+        min_keep = min(int(min_keep), points.shape[0])
+        if int(inlier.sum().item()) < min_keep:
+            keep_idx = torch.topk(nearest, k=min_keep, largest=False).indices
+            inlier = torch.zeros_like(inlier, dtype=torch.bool)
+            inlier[keep_idx] = True
+        return inlier
+
+
 def _orient_tree_edges(num_nodes, undirected_edges, root):
     if num_nodes <= 1 or len(undirected_edges) == 0:
         return np.empty((0, 2), dtype=np.int64), np.zeros((num_nodes,), dtype=np.int64)
@@ -2227,7 +2257,8 @@ class GaussianModel:
             loss_bind = self.build_surface(plant_prior=plant_prior)
             return loss_bind
 
-    def stpr_to_graph(self,opacity_threshold=0, anisotrpopy_threshold=1,save_mst=False, min_branch_candidates=16):  # 0.2 ,30
+    def stpr_to_graph(self,opacity_threshold=0, anisotrpopy_threshold=1,save_mst=False, min_branch_candidates=16,
+                      outlier_nn_factor=8.0):  # 0.2 ,30
         # MST for grpah extraction
         # step1: Noise filtering
         if self.structure_gs._pst_logit is not None:
@@ -2271,6 +2302,24 @@ class GaussianModel:
             empty_edges = np.empty((0, 2), dtype=np.int32)
             return empty_edges, empty_points, torch.tensor(0.0, device=self.device)
         center = self.structure_gs.get_xyz[keep] # (N,3)
+        inlier = _spatial_inlier_mask(
+            center,
+            outlier_factor=outlier_nn_factor,
+            min_keep=min(8, int(min_branch_candidates)),
+        )
+        if not inlier.all():
+            keep_indices = torch.nonzero(keep, as_tuple=False).view(-1)
+            keep = torch.zeros_like(keep, dtype=torch.bool)
+            keep[keep_indices[inlier]] = True
+            print(
+                f"[DEBUG][graph] removed {int((~inlier).sum().item())} isolated branch StPr "
+                f"outlier(s) before graph extraction."
+            )
+            if not keep.any():
+                empty_points = np.empty((0, 3), dtype=np.float32)
+                empty_edges = np.empty((0, 2), dtype=np.int32)
+                return empty_edges, empty_points, torch.tensor(0.0, device=self.device)
+            center = self.structure_gs.get_xyz[keep]
         scales = self.structure_gs.get_scaling[keep]
         rot = self.structure_gs.get_rotation[keep]
         rot_matrix = quaternion_to_matrix(rot) #
@@ -2361,6 +2410,16 @@ class GaussianModel:
             keep[selected] = True
 
         branch_indices = torch.nonzero(keep, as_tuple=False).view(-1)
+        if branch_indices.numel() >= 4:
+            inlier = _spatial_inlier_mask(
+                stprs.get_xyz[branch_indices],
+                outlier_factor=8.0,
+                min_keep=min(8, int(min_branch_candidates)),
+            )
+            if not inlier.all():
+                branch_indices = branch_indices[inlier]
+                keep = torch.zeros_like(branch_mask, dtype=torch.bool)
+                keep[branch_indices] = True
         n = int(branch_indices.numel())
         if n < 2:
             return stprs.get_xyz.sum() * 0.0
