@@ -415,7 +415,11 @@ def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False, min_clu
 
 def z_axis_to_vector_rotation(target_vector,target: Literal['gs', 'cylinder']):
     """Compute rotation that aligns [0, 0, 1] to target_vector"""
-    target_vector = target_vector / np.linalg.norm(target_vector)
+    target_vector = np.asarray(target_vector, dtype=np.float64)
+    norm = np.linalg.norm(target_vector)
+    if not np.isfinite(norm) or norm < 1e-8:
+        return np.eye(3, dtype=np.float32)
+    target_vector = target_vector / norm
     if target == 'gs':
         z_axis = np.array([1, 0, 0])
     elif target == 'cylinder':
@@ -424,15 +428,16 @@ def z_axis_to_vector_rotation(target_vector,target: Literal['gs', 'cylinder']):
         raise ValueError("target must be 'gs' or 'cylinder'")
     v = np.cross(z_axis, target_vector)
     c = np.dot(z_axis, target_vector)
+    c = float(np.clip(c, -1.0, 1.0))
     if np.isclose(c, 1.0):  # Already aligned
-        return np.eye(3)
+        return np.eye(3, dtype=np.float32)
     if np.isclose(c, -1.0):  # Opposite
-        return R.from_rotvec(np.pi * np.array([1, 0, 0])).as_matrix()
+        return R.from_rotvec(np.pi * np.array([1, 0, 0])).as_matrix().astype(np.float32)
     vx = np.array([[0, -v[2], v[1]],
                    [v[2], 0, -v[0]],
                    [-v[1], v[0], 0]])
     rot_matrix = np.eye(3) + vx + vx @ vx * (1 / (1 + c))
-    return rot_matrix
+    return rot_matrix.astype(np.float32)
 
 def z_axis_to_vector_rotation_torch(target_vector: torch.Tensor, target: str = 'cylinder') -> torch.Tensor:
     """
@@ -476,12 +481,25 @@ def z_axis_to_vector_rotation_torch(target_vector: torch.Tensor, target: str = '
     return rot_matrix
 
 def estimate_gs_para_from_cluster(xyz,test_flag=False):
+    xyz = np.asarray(xyz, dtype=np.float64)
+    xyz = xyz[np.isfinite(xyz).all(axis=1)]
+    if xyz.shape[0] == 0:
+        center = np.zeros((3,), dtype=np.float32)
+        rot_gs = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        scale = np.array([0.01, 0.01, 0.01], dtype=np.float32)
+        return center, rot_gs, scale, np.eye(3, dtype=np.float32), np.eye(3, dtype=np.float32)
+    if xyz.shape[0] < 3:
+        center = np.mean(xyz, axis=0).astype(np.float32)
+        rot_gs = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        scale = np.array([0.01, 0.01, 0.01], dtype=np.float32)
+        return center, rot_gs, scale, np.eye(3, dtype=np.float32), np.eye(3, dtype=np.float32)
+
     cov = np.cov(xyz.T)
+    cov = np.nan_to_num(cov, nan=0.0, posinf=0.0, neginf=0.0)
+    cov = 0.5 * (cov + cov.T)
     eigvals, eigvecs = np.linalg.eigh(cov)
-    # width = 3 * np.sqrt(eigvals[0])
-    # height = 3 * np.sqrt(eigvals[1])
-    width = 3 * np.sqrt(eigvals[1])
-    height = 3 * np.sqrt(eigvals[0])
+    eigvals = np.nan_to_num(eigvals, nan=0.0, posinf=0.0, neginf=0.0)
+    eigvals = np.clip(eigvals, 1e-8, None)
     idx = eigvals.argsort()[::-1]
     eigvals = eigvals[idx]
     eigvecs = eigvecs[:, idx]
@@ -501,6 +519,7 @@ def estimate_gs_para_from_cluster(xyz,test_flag=False):
 
     # for cylinder main axis
     scale = np.sqrt(eigvals).clip(min=0.01)
+    scale = np.nan_to_num(scale, nan=0.01, posinf=0.01, neginf=0.01).astype(np.float32)
     if test_flag:
         fig = plt.figure()
         ax = fig.add_subplot(111, projection='3d')
@@ -512,7 +531,7 @@ def estimate_gs_para_from_cluster(xyz,test_flag=False):
         ax.set_title("PCA Eigenvectors")
         ax.legend()
         plt.show()
-    return center,rot_gs,scale, rot_matrix_cylinder,rot_matrix_disk
+    return center.astype(np.float32),rot_gs.astype(np.float32),scale, rot_matrix_cylinder.astype(np.float32),rot_matrix_disk.astype(np.float32)
 
 def branch_to_cylinder(branch_points,branch_positions,branch_scales, branch_rotations,filename="cylinder_branch_init.ply",save_flag=False):
     cylinder_meshes = []

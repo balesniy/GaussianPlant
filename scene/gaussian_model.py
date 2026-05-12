@@ -454,7 +454,38 @@ class GaussianModel:
                 })
         return self._stpr_graph_gnn
 
-    def initialize_stpr_type_logits(self, labels, confidence=2.0):
+    def _ransac_trunk_axis(self, xyz, radius, root_axis=2, iterations=128, radius_factor=2.5):
+        if xyz.shape[0] < 2:
+            return None
+        best_score = None
+        best_axis = None
+        best_point = None
+        n = xyz.shape[0]
+        threshold = (torch.median(radius).clamp(min=1e-5) * float(radius_factor)).detach()
+        generator = torch.Generator(device=xyz.device)
+        generator.manual_seed(17)
+        for _ in range(int(iterations)):
+            pair = torch.randperm(n, generator=generator, device=xyz.device)[:2]
+            p0 = xyz[pair[0]]
+            p1 = xyz[pair[1]]
+            axis = F.normalize(p1 - p0, dim=0, eps=1e-8)
+            if not torch.isfinite(axis).all() or torch.linalg.norm(p1 - p0) < 1e-6:
+                continue
+            rel = xyz - p0
+            projected = (rel * axis).sum(dim=-1, keepdim=True) * axis
+            radial_dist = torch.linalg.norm(rel - projected, dim=-1)
+            inliers = radial_dist < threshold
+            vertical = torch.abs(axis[int(root_axis)]) if 0 <= int(root_axis) < 3 else torch.abs(axis[2])
+            score = inliers.float().sum() + 0.25 * vertical * n
+            if best_score is None or score > best_score:
+                best_score = score
+                best_axis = axis
+                best_point = p0
+        if best_axis is None:
+            return None
+        return best_point, best_axis, threshold
+
+    def initialize_stpr_type_logits(self, labels, confidence=2.0, root_axis=2):
         labels = labels or []
         n = len(labels)
         if n == 0:
@@ -467,16 +498,24 @@ class GaussianModel:
             xyz = self.get_xyz[branch_idx].detach()
             scales = self.get_scaling[branch_idx].detach()
             radius = scales[:, 1:].mean(dim=-1)
-            root_axis = 2
+            root_axis = int(root_axis) if 0 <= int(root_axis) < 3 else 2
             height = xyz[:, root_axis]
             radius_score = (radius - radius.min()) / (radius.max() - radius.min()).clamp(min=1e-6)
             base_score = (height.max() - height) / (height.max() - height.min()).clamp(min=1e-6)
-            trunk_score = 0.6 * radius_score + 0.4 * base_score
+            ransac_score = torch.zeros_like(radius_score)
+            ransac = self._ransac_trunk_axis(xyz, radius, root_axis=root_axis)
+            if ransac is not None:
+                axis_point, axis_dir, axis_radius = ransac
+                rel = xyz - axis_point
+                projected = (rel * axis_dir).sum(dim=-1, keepdim=True) * axis_dir
+                radial_dist = torch.linalg.norm(rel - projected, dim=-1)
+                ransac_score = torch.exp(-radial_dist / axis_radius.clamp(min=1e-6))
+            trunk_score = 0.45 * radius_score + 0.35 * base_score + 0.20 * ransac_score
             trunk_count = max(1, min(int(np.ceil(0.15 * len(branch_indices))), len(branch_indices)))
             trunk_local = torch.topk(trunk_score, k=trunk_count, largest=True).indices
             trunk_idx = branch_idx[trunk_local]
             logits[branch_idx, 1] = float(confidence)
-            logits[trunk_idx, 0] = float(confidence)
+            logits[trunk_idx, 0] = float(confidence) + trunk_score[trunk_local]
             logits[trunk_idx, 1] = 0.0
         if leaf_indices:
             leaf_idx = torch.tensor(leaf_indices, dtype=torch.long, device=self.device)
@@ -1330,7 +1369,7 @@ class GaussianModel:
         stpr_features_rest = torch.tensor(np.array(stpr_features_rest), dtype=torch.float, device=self.device)
         # stpr_opacities = torch.tensor(stpr_opacities, dtype=torch.float, device=self.device)
         # check nan in stpr_scales, rTypeError: can't convert cuda:7 device type tensor to numpy. Use Tensor.cpu() to copy the tensor to host memory first.eplace nan with 0.1
-        stpr_scales[torch.isnan(stpr_scales)] = 0.1
+        stpr_scales = torch.nan_to_num(stpr_scales, nan=0.01, posinf=0.01, neginf=0.01).clamp(min=1e-5)
         stpr_sur_rots = torch.tensor(np.array(surf_rotations), dtype=torch.float, device=self.device)
         print(f"[DEBUG][stpr] num StPr before scale_filter={stpr_scales.shape[0]}")
         if scene_extent is None:
@@ -2460,7 +2499,14 @@ class GaussianModel:
                 return edge_logits.sum() * 0.0
             selected_pairs = {tuple(sorted((int(a0), int(b0)))) for a0, b0 in selected_np.tolist()}
             target_np = np.asarray([1.0 if tuple(edge) in selected_pairs else 0.0 for edge in edge_np], dtype=np.float32)
-            root = int(torch.argmin(xyz[:, int(root_axis)].detach()).item()) if 0 <= int(root_axis) < 3 else 0
+            if 0 <= int(root_axis) < 3:
+                height_detached = xyz[:, int(root_axis)].detach()
+            else:
+                height_detached = xyz[:, 2].detach()
+            height_score = (height_detached - height_detached.min()) / (height_detached.max() - height_detached.min()).clamp(min=1e-6)
+            radius_score = (radius.detach() - radius.detach().min()) / (radius.detach().max() - radius.detach().min()).clamp(min=1e-6)
+            root_score = height_score - 0.35 * radius_score - 0.5 * p_trunk_kept.detach()
+            root = int(torch.argmin(root_score).item())
             oriented_np, _ = _orient_tree_edges(n, selected_np, root)
 
         targets = torch.as_tensor(target_np, dtype=edge_logits.dtype, device=device)
@@ -2504,6 +2550,8 @@ class GaussianModel:
                 "mean_selected_edge_length": float(edge_lengths_np[selected_edge_indices].mean()) if selected_edge_indices.size else 0.0,
                 "mean_hard_negative_logit": float(neg_logits.detach().mean().item()) if "neg_logits" in locals() and neg_logits.numel() else 0.0,
                 "gnn_edge_logit_mean": float(learned_edge_logit.detach().mean().item()) if learned_edge_logit is not None else 0.0,
+                "root_index": int(root),
+                "root_trunk_prob": float(p_trunk_kept[root].detach().item()) if p_trunk_kept.numel() else 0.0,
                 "radius_violation_rate": 0.0,
                 "pst_selected_mean": float(p_branch_kept[selected_nodes_t].detach().mean().item()) if selected_nodes_t.numel() else 0.0,
                 "max_degree": 0.0,

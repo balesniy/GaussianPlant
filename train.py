@@ -143,6 +143,7 @@ def add_tree_constrained_stpr_loss(gaussians, loss, args, iteration, stage):
                 f"max_degree={stats['max_degree']:.1f} "
                 f"gnn_logit={stats.get('gnn_edge_logit_mean', 0.0):.4g} "
                 f"trunk_p={stats.get('trunk_prob_mean', 0.0):.3f} "
+                f"root_trunk={stats.get('root_trunk_prob', 0.0):.3f} "
                 f"leaf_attach={stats.get('leaf_attachment_count', 0)} "
                 f"flow_loss={stats.get('vascular_flow_loss', 0.0):.4g}"
             )
